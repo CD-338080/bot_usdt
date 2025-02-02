@@ -1,0 +1,5 @@
+python-telegram-bot==20.0
+asyncio
+aiopg
+cachetools
+nest_asyncio

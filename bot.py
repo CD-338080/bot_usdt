@@ -69,12 +69,18 @@ class DatabasePool:
         # Initialize user cache
         self.user_cache = TTLCache(maxsize=100000, ttl=600)
 
+    def get_connection(self):
+        """Get a database connection"""
+        if not self.conn or self.conn.closed:
+            self.conn = psycopg2.connect(**self.db_params)
+            self.conn.autocommit = True
+        return self.conn
+
     async def initialize(self):
         """Initialize database connection"""
         if not self._initialized:
             try:
-                self.conn = psycopg2.connect(**self.db_params)
-                self.conn.autocommit = True
+                self.conn = self.get_connection()
                 await self._initialize_tables()
                 self._initialized = True
                 logger.info("Database connection established successfully")
@@ -84,7 +90,8 @@ class DatabasePool:
 
     async def _initialize_tables(self):
         """Initialize database tables"""
-        with self.conn.cursor() as cur:
+        conn = self.get_connection()
+        with conn.cursor() as cur:
             try:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
@@ -107,15 +114,20 @@ class DatabasePool:
 
     @asynccontextmanager
     async def connection(self):
-        if not self.conn:
-            await self.initialize()
-        async with self.conn.cursor() as conn:
-            yield conn
+        """Get a database connection"""
+        conn = self.get_connection()
+        try:
+            with conn.cursor(cursor_factory=DictCursor) as cur:
+                yield cur
+        finally:
+            if conn:
+                conn.close()
 
     async def save_user(self, user_data: dict):
         """Guardar datos del usuario en PostgreSQL"""
-        async with self.conn.cursor() as cur:
-            await cur.execute("""
+        conn = self.get_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
                 INSERT INTO users 
                 (user_id, username, balance, total_earned, referrals, 
                 last_claim, last_daily, wallet, referred_by, join_date)
@@ -636,61 +648,59 @@ class SUIBot:
             await update.message.reply_text("❌ An error occurred!")
 
     async def start_notification_task(self):
-        """Background task to check and send notifications with batch processing"""
+        """Background task to check and send notifications"""
         BATCH_SIZE = 1000
         while True:
             try:
-                async with self.db_pool.connection() as conn:
-                    async with conn.cursor() as cur:
-                        await cur.execute("SELECT COUNT(*) as count FROM users")
-                        result = await cur.fetchone()
-                        total_users = result['count']
+                conn = self.db_pool.get_connection()
+                with conn.cursor(cursor_factory=DictCursor) as cur:
+                    cur.execute("SELECT COUNT(*) as count FROM users")
+                    result = cur.fetchone()
+                    total_users = result['count']
+                    
+                    for offset in range(0, total_users, BATCH_SIZE):
+                        cur.execute("""
+                            SELECT user_id, last_claim, last_daily 
+                            FROM users 
+                            LIMIT %s OFFSET %s
+                        """, (BATCH_SIZE, offset))
                         
-                        for offset in range(0, total_users, BATCH_SIZE):
-                            await cur.execute("""
-                                SELECT user_id, last_claim, last_daily 
-                                FROM users 
-                                LIMIT %s OFFSET %s
-                            """, (BATCH_SIZE, offset))
+                        rows = cur.fetchall()
+                        for row in rows:
+                            user_data = dict(row)
+                            user_id = user_data["user_id"]
                             
-                            rows = await cur.fetchall()
-                            for row in rows:
-                                user_data = dict(row)
-                                user_id = user_data["user_id"]
-                                
-                                # Check daily bonus
-                                last_daily = user_data["last_daily"]
-                                if datetime.now() - last_daily > timedelta(days=1):
-                                    try:
-                                        await self.application.bot.send_message(
-                                            chat_id=user_id,
-                                            text="📅 Your daily bonus is ready!\nCome back to claim it!"
-                                        )
-                                    except Exception as e:
-                                        logger.error(f"Failed to send daily notification to {user_id}: {e}")
-                                
-                                # Check claim
-                                last_claim = user_data["last_claim"]
-                                if datetime.now() - last_claim > timedelta(hours=1):
-                                    try:
-                                        await self.application.bot.send_message(
-                                            chat_id=user_id,
-                                            text="🌟 Hey! Collect your bonus\nClaim it now!"
-                                        )
-                                    except Exception as e:
-                                        logger.error(f"Failed to send claim notification to {user_id}: {e}")
-                                
-                                # Small delay to avoid rate limits
-                                await asyncio.sleep(0.05)
-                            
-                            # Add delay between batches
-                            await asyncio.sleep(1)
-                            
+                            # Process notifications...
+                            await self._process_notifications(user_id, user_data)
+                            await asyncio.sleep(0.05)
+                        
+                        await asyncio.sleep(1)
+                        
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
             
-            # Wait 5 minutes before next check
             await asyncio.sleep(300)
+
+    async def _process_notifications(self, user_id: str, user_data: dict):
+        """Process notifications for a single user"""
+        try:
+            # Check daily bonus
+            last_daily = datetime.fromisoformat(user_data["last_daily"])
+            if datetime.now() - last_daily > timedelta(days=1):
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text="📅 Your daily bonus is ready!\nCome back to claim it!"
+                )
+            
+            # Check claim
+            last_claim = datetime.fromisoformat(user_data["last_claim"])
+            if datetime.now() - last_claim > timedelta(hours=1):
+                await self.application.bot.send_message(
+                    chat_id=user_id,
+                    text="🌟 Hey! Collect your bonus\nClaim it now!"
+                )
+        except Exception as e:
+            logger.error(f"Failed to process notifications for {user_id}: {e}")
 
 async def main():
     """Initialize and start the bot with proper error handling"""

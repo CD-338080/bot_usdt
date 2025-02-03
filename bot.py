@@ -11,6 +11,7 @@ import nest_asyncio
 from contextlib import asynccontextmanager
 import aiopg
 import os
+import sys
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -24,9 +25,12 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Bot configuration
-TOKEN = "7984419091:AAEBWdMVWqkZuXV4HGt4ZTpx8_BOtUxUI8o"
-ADMIN_ID = "7599636103"
-SUI_ADDRESS = "0x337c26191d7d2874ffbca5911a2dd1126b4ceaa12a279f1d232b7856da6ccd88"
+TOKEN = os.getenv('BOT_TOKEN')
+ADMIN_ID = os.getenv('ADMIN_ID')
+SUI_ADDRESS = os.getenv('SUI_ADDRESS')
+
+if not all([TOKEN, ADMIN_ID, SUI_ADDRESS]):
+    raise ValueError("Missing required environment variables")
 
 # Rewards system
 REWARDS = {
@@ -45,40 +49,80 @@ class DatabasePool:
         self._lock = asyncio.Lock()
         self._initialized = False
         
-        # Use DATABASE_URL from environment variable
-        self.db_url = os.getenv('DATABASE_URL', 'postgresql://postgres:WhLuYoqHrGkeQtleZAEodiMoEEQcdVvV@postgres.railway.internal:5432/railway')
+        # Get database URL from environment with fallback
+        self.db_url = os.getenv('DATABASE_URL')
+        if not self.db_url:
+            raise ValueError("DATABASE_URL environment variable is required")
         
         # Initialize user cache
         self.user_cache = TTLCache(maxsize=100000, ttl=600)
 
     async def initialize(self):
-        if not self._initialized:
-            async with self._lock:
-                if not self._initialized:
-                    try:
-                        self.pool = await aiopg.create_pool(self.db_url, maxsize=self.pool_size)
-                        self._initialized = True
-                        
-                        async with self.pool.acquire() as conn:
-                            async with conn.cursor() as cur:
-                                await cur.execute("""
-                                    CREATE TABLE IF NOT EXISTS users (
-                                        user_id VARCHAR(32) PRIMARY KEY,
-                                        username VARCHAR(64),
-                                        balance NUMERIC(20,8) DEFAULT 0,
-                                        total_earned NUMERIC(20,8) DEFAULT 0,
-                                        referrals INT DEFAULT 0,
-                                        last_claim TIMESTAMP,
-                                        last_daily TIMESTAMP,
-                                        wallet VARCHAR(42),
-                                        referred_by VARCHAR(32),
-                                        join_date TIMESTAMP
-                                    )
-                                """)
-                                await conn.commit()
-                    except Exception as e:
-                        logger.error(f"Database initialization failed: {e}")
-                        raise
+        max_retries = 3
+        retry_delay = 5  # seconds
+        
+        for attempt in range(max_retries):
+            if not self._initialized:
+                async with self._lock:
+                    if not self._initialized:
+                        try:
+                            # Add connection timeout
+                            self.pool = await aiopg.create_pool(
+                                self.db_url,
+                                maxsize=self.pool_size,
+                                timeout=10,
+                                echo=True
+                            )
+                            
+                            # Test connection
+                            async with self.pool.acquire() as conn:
+                                async with conn.cursor() as cur:
+                                    await cur.execute("SELECT 1")
+                                    await cur.fetchone()
+                            
+                            self._initialized = True
+                            logger.info("Database connection established successfully")
+                            
+                            # Initialize tables
+                            await self._initialize_tables()
+                            return
+                            
+                        except Exception as e:
+                            logger.error(f"Database initialization attempt {attempt + 1} failed: {str(e)}")
+                            if self.pool:
+                                self.pool.close()
+                                await self.pool.wait_closed()
+                            
+                            if attempt < max_retries - 1:
+                                logger.info(f"Retrying in {retry_delay} seconds...")
+                                await asyncio.sleep(retry_delay)
+                            else:
+                                raise RuntimeError(f"Failed to initialize database after {max_retries} attempts")
+
+    async def _initialize_tables(self):
+        """Initialize database tables with proper error handling"""
+        async with self.pool.acquire() as conn:
+            async with conn.cursor() as cur:
+                try:
+                    await cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            user_id VARCHAR(32) PRIMARY KEY,
+                            username VARCHAR(64),
+                            balance NUMERIC(20,8) DEFAULT 0,
+                            total_earned NUMERIC(20,8) DEFAULT 0,
+                            referrals INT DEFAULT 0,
+                            last_claim TIMESTAMP,
+                            last_daily TIMESTAMP,
+                            wallet VARCHAR(42),
+                            referred_by VARCHAR(32),
+                            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
+                    await conn.commit()
+                    logger.info("Database tables initialized successfully")
+                except Exception as e:
+                    logger.error(f"Failed to initialize tables: {str(e)}")
+                    raise
 
     @asynccontextmanager
     async def connection(self):
@@ -139,12 +183,21 @@ class DatabasePool:
 
 class SUIBot:
     def __init__(self):
+        # Validate required environment variables
+        self.token = os.getenv('BOT_TOKEN')
+        if not self.token:
+            raise ValueError("BOT_TOKEN environment variable is required")
+            
+        self.admin_id = os.getenv('ADMIN_ID')
+        if not self.admin_id:
+            raise ValueError("ADMIN_ID environment variable is required")
+        
         # Initialize database pool with larger size
         self.db_pool = DatabasePool(pool_size=20)
         
         # Enhanced cache configurations
-        self.user_cache = TTLCache(maxsize=100000, ttl=600)  # 100k users, 10 min TTL
-        self.balance_cache = LRUCache(maxsize=100000)  # Increased cache size
+        self.user_cache = TTLCache(maxsize=100000, ttl=600)
+        self.balance_cache = LRUCache(maxsize=100000)
         
         # Prepare keyboard markup once
         self._keyboard = self._create_keyboard()
@@ -662,42 +715,68 @@ class SUIBot:
             await asyncio.sleep(300)
 
 async def main():
-    """Initialize and start the bot"""
+    """Initialize and start the bot with proper error handling"""
+    bot = None
     try:
+        # Initialize bot
         bot = SUIBot()
-        await bot.init_db()
-        await bot.db_pool.optimize_db()
         
-        application = Application.builder().token(TOKEN).build()
+        # Initialize database
+        try:
+            await bot.init_db()
+        except Exception as e:
+            logger.error(f"Failed to initialize database: {str(e)}")
+            return
+            
+        # Optimize database
+        try:
+            await bot.db_pool.optimize_db()
+        except Exception as e:
+            logger.error(f"Failed to optimize database: {str(e)}")
+            # Continue execution as this is not critical
+        
+        # Initialize application
+        application = Application.builder().token(bot.token).build()
         bot.application = application
 
         # Add handlers
         application.add_handler(CommandHandler("start", bot.start))
         application.add_handler(CommandHandler("mailing", bot.handle_mailing))
         application.add_handler(CommandHandler("stats", bot.handle_stats))
-        application.add_handler(MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("⚡ Please send /start to begin")))
+        application.add_handler(MessageHandler(
+            filters.COMMAND,
+            lambda u,c: u.message.reply_text("⚡ Please send /start to begin")
+        ))
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             bot.handle_message
         ))
         
-        # Start the notification task
+        # Start notification task
         notification_task = asyncio.create_task(bot.start_notification_task())
         
-        print("Bot started successfully!")
+        logger.info("Bot started successfully!")
         await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
     except Exception as e:
-        logger.error(f"Critical error starting bot: {e}")
-        print(f"Error starting bot: {e}")
+        logger.error(f"Critical error starting bot: {str(e)}")
+        raise
     finally:
         # Ensure proper cleanup
-        await bot.db_pool.close()
-        if 'notification_task' in locals():
-            notification_task.cancel()
-            try:
-                await notification_task
-            except asyncio.CancelledError:
-                pass
+        if bot and bot.db_pool:
+            await bot.db_pool.close()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    # Configure logging
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO  # Changed to INFO for better debugging
+    )
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {str(e)}")
+        sys.exit(1)

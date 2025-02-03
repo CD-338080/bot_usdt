@@ -9,9 +9,11 @@ import asyncio
 from cachetools import TTLCache, LRUCache
 import nest_asyncio
 from contextlib import asynccontextmanager
-import aiopg
 import os
 import sys
+import psycopg2
+from psycopg2.extras import DictCursor
+from urllib.parse import urlparse
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -19,7 +21,7 @@ nest_asyncio.apply()
 # Logging configuration - only log errors
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-    level=logging.ERROR
+    level=logging.INFO  # Cambiado a INFO para ver más detalles
 )
 
 logger = logging.getLogger(__name__)
@@ -45,141 +47,114 @@ REWARDS = {
 class DatabasePool:
     def __init__(self, pool_size: int = 20):
         self.pool_size = pool_size
-        self.pool = None
+        self.conn = None
         self._lock = asyncio.Lock()
         self._initialized = False
         
-        # Get database URL from environment with fallback
+        # Get database URL from environment
         self.db_url = os.getenv('DATABASE_URL')
         if not self.db_url:
             raise ValueError("DATABASE_URL environment variable is required")
+        
+        # Parse DATABASE_URL
+        url = urlparse(self.db_url)
+        self.db_params = {
+            'dbname': url.path[1:],
+            'user': url.username,
+            'password': url.password,
+            'host': url.hostname,
+            'port': url.port
+        }
         
         # Initialize user cache
         self.user_cache = TTLCache(maxsize=100000, ttl=600)
 
     async def initialize(self):
-        """Initialize database pool with proper error handling"""
-        max_retries = 3
-        retry_delay = 5  # seconds
-        
-        for attempt in range(max_retries):
-            if not self._initialized:
-                async with self._lock:
-                    if not self._initialized:
-                        try:
-                            # Create connection pool without autocommit
-                            dsn = self.db_url
-                            self.pool = await aiopg.create_pool(
-                                dsn,
-                                minsize=1,
-                                maxsize=self.pool_size,
-                                timeout=10,
-                                echo=True
-                            )
-                            
-                            # Test connection
-                            async with self.pool.acquire() as conn:
-                                async with conn.cursor() as cur:
-                                    await cur.execute("SELECT 1")
-                                    await cur.fetchone()
-                            
-                            self._initialized = True
-                            logger.info("Database connection established successfully")
-                            
-                            # Initialize tables
-                            await self._initialize_tables()
-                            return
-                            
-                        except Exception as e:
-                            logger.error(f"Database initialization attempt {attempt + 1} failed: {str(e)}")
-                            if self.pool:
-                                self.pool.close()
-                                await self.pool.wait_closed()
-                            
-                            if attempt < max_retries - 1:
-                                logger.info(f"Retrying in {retry_delay} seconds...")
-                                await asyncio.sleep(retry_delay)
-                            else:
-                                raise RuntimeError(f"Failed to initialize database after {max_retries} attempts")
+        """Initialize database connection"""
+        if not self._initialized:
+            try:
+                self.conn = psycopg2.connect(**self.db_params)
+                self.conn.autocommit = True
+                await self._initialize_tables()
+                self._initialized = True
+                logger.info("Database connection established successfully")
+            except Exception as e:
+                logger.error(f"Database initialization failed: {str(e)}")
+                raise
 
     async def _initialize_tables(self):
-        """Initialize database tables with proper error handling"""
-        async with self.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                try:
-                    await cur.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id VARCHAR(32) PRIMARY KEY,
-                            username VARCHAR(64),
-                            balance NUMERIC(20,8) DEFAULT 0,
-                            total_earned NUMERIC(20,8) DEFAULT 0,
-                            referrals INT DEFAULT 0,
-                            last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            wallet VARCHAR(42),
-                            referred_by VARCHAR(32),
-                            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                    logger.info("Database tables initialized successfully")
-                except Exception as e:
-                    logger.error(f"Failed to initialize tables: {str(e)}")
-                    raise
-
+        """Initialize database tables"""
+        with self.conn.cursor() as cur:
+            try:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id VARCHAR(32) PRIMARY KEY,
+                        username VARCHAR(64),
+                        balance NUMERIC(20,8) DEFAULT 0,
+                        total_earned NUMERIC(20,8) DEFAULT 0,
+                        referrals INT DEFAULT 0,
+                        last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        wallet VARCHAR(42),
+                        referred_by VARCHAR(32),
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                logger.info("Database tables initialized successfully")
+            except Exception as e:
+                logger.error(f"Failed to initialize tables: {str(e)}")
+                raise
 
     @asynccontextmanager
     async def connection(self):
-        if not self.pool:
+        if not self.conn:
             await self.initialize()
-        async with self.pool.acquire() as conn:
+        async with self.conn.cursor() as conn:
             yield conn
 
     async def save_user(self, user_data: dict):
         """Guardar datos del usuario en PostgreSQL"""
-        async with self.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("""
-                    INSERT INTO users 
-                    (user_id, username, balance, total_earned, referrals, 
-                    last_claim, last_daily, wallet, referred_by, join_date)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    balance = EXCLUDED.balance,
-                    total_earned = EXCLUDED.total_earned,
-                    referrals = EXCLUDED.referrals,
-                    last_claim = EXCLUDED.last_claim,
-                    last_daily = EXCLUDED.last_daily,
-                    wallet = EXCLUDED.wallet,
-                    referred_by = EXCLUDED.referred_by
-                """, (
-                    user_data["user_id"],
-                    user_data["username"],
-                    Decimal(user_data["balance"]),
-                    Decimal(user_data["total_earned"]),
-                    user_data["referrals"],
-                    datetime.fromisoformat(user_data["last_claim"]) if user_data["last_claim"] else None,
-                    datetime.fromisoformat(user_data["last_daily"]) if user_data["last_daily"] else None,
-                    user_data.get("wallet"),
-                    user_data.get("referred_by"),
-                    datetime.fromisoformat(user_data.get("join_date", datetime.now().isoformat()))
-                ))
+        async with self.conn.cursor() as cur:
+            await cur.execute("""
+                INSERT INTO users 
+                (user_id, username, balance, total_earned, referrals, 
+                last_claim, last_daily, wallet, referred_by, join_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                balance = EXCLUDED.balance,
+                total_earned = EXCLUDED.total_earned,
+                referrals = EXCLUDED.referrals,
+                last_claim = EXCLUDED.last_claim,
+                last_daily = EXCLUDED.last_daily,
+                wallet = EXCLUDED.wallet,
+                referred_by = EXCLUDED.referred_by
+            """, (
+                user_data["user_id"],
+                user_data["username"],
+                Decimal(user_data["balance"]),
+                Decimal(user_data["total_earned"]),
+                user_data["referrals"],
+                datetime.fromisoformat(user_data["last_claim"]) if user_data["last_claim"] else None,
+                datetime.fromisoformat(user_data["last_daily"]) if user_data["last_daily"] else None,
+                user_data.get("wallet"),
+                user_data.get("referred_by"),
+                datetime.fromisoformat(user_data.get("join_date", datetime.now().isoformat()))
+            ))
         
         # Actualizar caché
         self.user_cache[user_data["user_id"]] = user_data.copy()
 
     async def optimize_db(self):
         """Optimize database performance for PostgreSQL"""
-        async with self.pool.acquire() as conn:
-            async with conn.cursor() as cur:
-                # Cambiado a comandos PostgreSQL
-                await cur.execute("VACUUM ANALYZE users")
+        async with self.conn.cursor() as cur:
+            # Cambiado a comandos PostgreSQL
+            cur.execute("VACUUM ANALYZE users")
 
     async def close(self):
         """Close the database pool"""
-        if self.pool:
-            self.pool.close()
-            await self.pool.wait_closed()
+        if self.conn:
+            self.conn.close()
             self._initialized = False
 
 class SUIBot:
@@ -724,17 +699,9 @@ async def main():
         # Initialize bot
         bot = SUIBot()
         
-        # Initialize database with retry
-        retry_count = 3
-        for attempt in range(retry_count):
-            try:
-                await bot.init_db()
-                break
-            except Exception as e:
-                logger.error(f"Database initialization attempt {attempt + 1} failed: {str(e)}")
-                if attempt == retry_count - 1:
-                    raise
-                await asyncio.sleep(5)
+        # Initialize database
+        await bot.init_db()
+        logger.info("Database initialized successfully")
         
         # Initialize application
         application = Application.builder().token(bot.token).build()
@@ -744,10 +711,6 @@ async def main():
         application.add_handler(CommandHandler("start", bot.start))
         application.add_handler(CommandHandler("mailing", bot.handle_mailing))
         application.add_handler(CommandHandler("stats", bot.handle_stats))
-        application.add_handler(MessageHandler(
-            filters.COMMAND,
-            lambda u, c: u.message.reply_text("⚠️ Unknown command")
-        ))
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             bot.handle_message
@@ -761,23 +724,14 @@ async def main():
         
     except Exception as e:
         logger.error(f"Critical error starting bot: {str(e)}")
-        raise
+        sys.exit(1)
     finally:
-        # Ensure proper cleanup
         if bot and bot.db_pool:
             await bot.db_pool.close()
 
 if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO  # Changed to INFO for better debugging
-    )
-    
     try:
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)

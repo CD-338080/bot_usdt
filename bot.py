@@ -170,6 +170,41 @@ class DatabasePool:
             self.conn.close()
             self._initialized = False
 
+    async def get_user(self, user_id: str) -> Optional[Dict]:
+        """Get user data from cache or database"""
+        # Check cache first
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+        
+        # Get from database
+        try:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute("""
+                    SELECT user_id, username, balance, total_earned, 
+                           referrals, last_claim, last_daily, wallet, 
+                           referred_by, join_date
+                    FROM users 
+                    WHERE user_id = %s
+                """, (user_id,))
+                
+                result = cur.fetchone()
+                if result:
+                    # Convert to dict and cache
+                    user_data = dict(result)
+                    # Convert datetime to ISO format string
+                    user_data["last_claim"] = user_data["last_claim"].isoformat()
+                    user_data["last_daily"] = user_data["last_daily"].isoformat()
+                    user_data["join_date"] = user_data["join_date"].isoformat()
+                    # Cache the result
+                    self.user_cache[user_id] = user_data
+                    return user_data
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting user {user_id}: {e}")
+            return None
+
 class SUIBot:
     def __init__(self):
         # Validate required environment variables
@@ -203,38 +238,6 @@ class SUIBot:
     async def init_db(self):
         """Initialize database with optimized schema"""
         await self.db_pool.initialize()
-
-    async def get_user(self, user_id: str) -> Optional[Dict]:
-        """Get user data with optimized caching"""
-        if user_id in self.user_cache:
-            return self.user_cache[user_id]
-
-        async with self.db_pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("""
-                    SELECT user_id, username, balance, total_earned, referrals,
-                           last_claim, last_daily, wallet, referred_by, join_date
-                    FROM users 
-                    WHERE user_id = %s
-                """, (user_id,))
-                
-                result = await cur.fetchone()
-                if result:
-                    # Convertir el resultado a diccionario
-                    user_data = dict(result)
-                    
-                    # Convertir Decimal a string
-                    user_data['balance'] = str(user_data['balance'])
-                    user_data['total_earned'] = str(user_data['total_earned'])
-                    
-                    # Convertir datetime a ISO string
-                    for field in ['last_claim', 'last_daily', 'join_date']:
-                        if user_data[field]:
-                            user_data[field] = user_data[field].isoformat()
-                    
-                    self.user_cache[user_id] = user_data
-                    return user_data
-        return None
 
     async def _notify_referrer(self, bot, referrer_id):
         """Separate notification function for better performance"""

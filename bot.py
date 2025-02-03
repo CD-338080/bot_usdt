@@ -732,40 +732,43 @@ async def main():
         
         logger.info("Bot started successfully!")
         
-        # Use drop_pending_updates to avoid conflicts
-        await application.initialize()
-        await application.start()
+        # Simplified polling setup
         await application.run_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
         )
         
     except Exception as e:
         logger.error(f"Critical error starting bot: {str(e)}")
         if bot and bot.db_pool:
             await bot.db_pool.close()
-        sys.exit(1)
+        raise  # Let the outer handler deal with exit
 
 # Add error handler function
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors in the telegram bot."""
     logger.error(f"Exception while handling an update: {context.error}")
     
-    # Send message to admin if available
     if ADMIN_ID:
-        await context.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=f"❌ Error in bot: {context.error}"
-        )
+        try:
+            await context.bot.send_message(
+                chat_id=ADMIN_ID,
+                text=f"❌ Error in bot: {context.error}"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send error message to admin: {e}")
 
 if __name__ == "__main__":
     try:
         # Set up signal handlers
         for signal_type in (SIGINT, SIGTERM, SIGABRT):
-            signal(signal_type, lambda s, f: sys.exit(0))
-            
+            signal(signal_type, lambda s, f: asyncio.get_event_loop().stop())
+        
         # Run the bot
         asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)

@@ -1,5 +1,6 @@
 python-telegram-bot==20.0
-asyncio
-aiopg
-cachetools
-nest_asyncio
+asyncio==3.4.3
+aiopg==1.4.0
+cachetools==5.3.2
+nest_asyncio==1.5.8
+python-dotenv==1.0.0

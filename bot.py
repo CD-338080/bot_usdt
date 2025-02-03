@@ -10,6 +10,7 @@ from cachetools import TTLCache, LRUCache
 import nest_asyncio
 from contextlib import asynccontextmanager
 import aiopg
+import os
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -44,10 +45,10 @@ class DatabasePool:
         self._lock = asyncio.Lock()
         self._initialized = False
         
-        # Corrección del formato de conexión para PostgreSQL
-        self.db_config = "dbname=railway user=postgres password=WhLuYoqHrGkeQtleZAEodiMoEEQcdVvV host=postgres.railway.internal port=5432"
+        # Use DATABASE_URL from environment variable
+        self.db_url = os.getenv('DATABASE_URL', 'postgresql://postgres:WhLuYoqHrGkeQtleZAEodiMoEEQcdVvV@postgres.railway.internal:5432/railway')
         
-        # Inicialización del caché de usuarios
+        # Initialize user cache
         self.user_cache = TTLCache(maxsize=100000, ttl=600)
 
     async def initialize(self):
@@ -55,12 +56,11 @@ class DatabasePool:
             async with self._lock:
                 if not self._initialized:
                     try:
-                        # Corrección de la creación del pool
-                        self.pool = await aiopg.create_pool(self.db_config, maxsize=self.pool_size)
+                        self.pool = await aiopg.create_pool(self.db_url, maxsize=self.pool_size)
                         self._initialized = True
                         
                         async with self.pool.acquire() as conn:
-                            async with conn.cursor() as cur:  # Eliminada referencia a aiomysql.DictCursor
+                            async with conn.cursor() as cur:
                                 await cur.execute("""
                                     CREATE TABLE IF NOT EXISTS users (
                                         user_id VARCHAR(32) PRIMARY KEY,
@@ -129,6 +129,13 @@ class DatabasePool:
                 # Cambiado a comandos PostgreSQL
                 await cur.execute("VACUUM ANALYZE users")
                 await conn.commit()
+
+    async def close(self):
+        """Close the database pool"""
+        if self.pool:
+            self.pool.close()
+            await self.pool.wait_closed()
+            self._initialized = False
 
 class SUIBot:
     def __init__(self):
@@ -219,7 +226,7 @@ class SUIBot:
                 }
 
                 # Process referral
-                if context.args and len(context.args) > 0:
+                if context.args and isinstance(context.args, list) and len(context.args) > 0:
                     try:
                         referrer_id = context.args[0]
                         logger.info(f"Processing referral: new user {user_id} referred by {referrer_id}")
@@ -668,7 +675,6 @@ async def main():
         application.add_handler(CommandHandler("start", bot.start))
         application.add_handler(CommandHandler("mailing", bot.handle_mailing))
         application.add_handler(CommandHandler("stats", bot.handle_stats))
-        # Add handler for invalid commands
         application.add_handler(MessageHandler(filters.COMMAND, lambda u,c: u.message.reply_text("⚡ Please send /start to begin")))
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
@@ -676,13 +682,22 @@ async def main():
         ))
         
         # Start the notification task
-        asyncio.create_task(bot.start_notification_task())
+        notification_task = asyncio.create_task(bot.start_notification_task())
         
         print("Bot started successfully!")
         await application.run_polling(allowed_updates=Update.ALL_TYPES)
     except Exception as e:
         logger.error(f"Critical error starting bot: {e}")
         print(f"Error starting bot: {e}")
+    finally:
+        # Ensure proper cleanup
+        await bot.db_pool.close()
+        if 'notification_task' in locals():
+            notification_task.cancel()
+            try:
+                await notification_task
+            except asyncio.CancelledError:
+                pass
 
 if __name__ == "__main__":
     asyncio.run(main())

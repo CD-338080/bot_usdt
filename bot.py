@@ -71,7 +71,8 @@ class DatabasePool:
                                 self.db_url,
                                 maxsize=self.pool_size,
                                 timeout=10,
-                                echo=True
+                                echo=True,
+                                autocommit=True
                             )
                             
                             # Test connection
@@ -118,7 +119,6 @@ class DatabasePool:
                             join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                         )
                     """)
-                    await conn.commit()
                     logger.info("Database tables initialized successfully")
                 except Exception as e:
                     logger.error(f"Failed to initialize tables: {str(e)}")
@@ -161,7 +161,6 @@ class DatabasePool:
                     user_data.get("referred_by"),
                     datetime.fromisoformat(user_data.get("join_date", datetime.now().isoformat()))
                 ))
-                await conn.commit()
         
         # Actualizar caché
         self.user_cache[user_data["user_id"]] = user_data.copy()
@@ -172,7 +171,6 @@ class DatabasePool:
             async with conn.cursor() as cur:
                 # Cambiado a comandos PostgreSQL
                 await cur.execute("VACUUM ANALYZE users")
-                await conn.commit()
 
     async def close(self):
         """Close the database pool"""
@@ -319,8 +317,7 @@ class SUIBot:
                                                 str(new_total),
                                                 referrer_id
                                             ))
-                                            await conn.commit()
-                                        logger.info(f"Updated referrer {referrer_id} balance")
+                                    logger.info(f"Updated referrer {referrer_id} balance")
 
                                     # Clear referrer cache
                                     self.user_cache.pop(referrer_id, None)
@@ -555,7 +552,6 @@ class SUIBot:
                                     last_daily = CURRENT_TIMESTAMP
                                 WHERE user_id = %s
                             """, (user_id,))
-                            await conn.commit()
                         await context.bot.send_message(
                             chat_id=user_id,
                             text=f"📢 Announcement:\n\n{message}"

@@ -58,6 +58,7 @@ class DatabasePool:
         self.user_cache = TTLCache(maxsize=100000, ttl=600)
 
     async def initialize(self):
+        """Initialize database pool with proper error handling"""
         max_retries = 3
         retry_delay = 5  # seconds
         
@@ -66,13 +67,14 @@ class DatabasePool:
                 async with self._lock:
                     if not self._initialized:
                         try:
-                            # Add connection timeout
+                            # Create connection pool without autocommit
+                            dsn = self.db_url
                             self.pool = await aiopg.create_pool(
-                                self.db_url,
+                                dsn,
+                                minsize=1,
                                 maxsize=self.pool_size,
                                 timeout=10,
-                                echo=True,
-                                autocommit=True
+                                echo=True
                             )
                             
                             # Test connection
@@ -123,6 +125,7 @@ class DatabasePool:
                 except Exception as e:
                     logger.error(f"Failed to initialize tables: {str(e)}")
                     raise
+
 
     @asynccontextmanager
     async def connection(self):
@@ -651,7 +654,7 @@ class SUIBot:
                 handler, args = handler_info
                 await handler(*args)
             else:
-                await update.message.reply_text("⚡ Please send /start to begin")
+                await update.message.reply_text("⚠️ Unknown command")
                 
         except Exception as e:
             logger.error(f"Error handling message: {e}")
@@ -733,13 +736,6 @@ async def main():
                     raise
                 await asyncio.sleep(5)
         
-        # Optimize database
-        try:
-            await bot.db_pool.optimize_db()
-        except Exception as e:
-            logger.error(f"Failed to optimize database: {str(e)}")
-            # Continue execution as this is not critical
-        
         # Initialize application
         application = Application.builder().token(bot.token).build()
         bot.application = application
@@ -750,7 +746,7 @@ async def main():
         application.add_handler(CommandHandler("stats", bot.handle_stats))
         application.add_handler(MessageHandler(
             filters.COMMAND,
-            lambda u,c: u.message.reply_text("⚡ Please send /start to begin")
+            lambda u, c: u.message.reply_text("⚠️ Unknown command")
         ))
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,

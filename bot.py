@@ -14,6 +14,7 @@ import sys
 import psycopg2
 from psycopg2.extras import DictCursor
 from urllib.parse import urlparse
+from signal import signal, SIGINT, SIGTERM, SIGABRT
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -713,9 +714,12 @@ async def main():
         await bot.init_db()
         logger.info("Database initialized successfully")
         
-        # Initialize application
+        # Initialize application with error handlers
         application = Application.builder().token(bot.token).build()
         bot.application = application
+
+        # Add error handler
+        application.add_error_handler(error_handler)
 
         # Add handlers
         application.add_handler(CommandHandler("start", bot.start))
@@ -726,21 +730,41 @@ async def main():
             bot.handle_message
         ))
         
-        # Start notification task
-        notification_task = asyncio.create_task(bot.start_notification_task())
-        
         logger.info("Bot started successfully!")
-        await application.run_polling(allowed_updates=Update.ALL_TYPES)
+        
+        # Use drop_pending_updates to avoid conflicts
+        await application.initialize()
+        await application.start()
+        await application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
+        )
         
     except Exception as e:
         logger.error(f"Critical error starting bot: {str(e)}")
-        sys.exit(1)
-    finally:
         if bot and bot.db_pool:
             await bot.db_pool.close()
+        sys.exit(1)
+
+# Add error handler function
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors in the telegram bot."""
+    logger.error(f"Exception while handling an update: {context.error}")
+    
+    # Send message to admin if available
+    if ADMIN_ID:
+        await context.bot.send_message(
+            chat_id=ADMIN_ID,
+            text=f"❌ Error in bot: {context.error}"
+        )
 
 if __name__ == "__main__":
     try:
+        # Set up signal handlers
+        for signal_type in (SIGINT, SIGTERM, SIGABRT):
+            signal(signal_type, lambda s, f: sys.exit(0))
+            
+        # Run the bot
         asyncio.run(main())
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")

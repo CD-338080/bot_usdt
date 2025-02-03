@@ -112,8 +112,8 @@ class DatabasePool:
                             balance NUMERIC(20,8) DEFAULT 0,
                             total_earned NUMERIC(20,8) DEFAULT 0,
                             referrals INT DEFAULT 0,
-                            last_claim TIMESTAMP,
-                            last_daily TIMESTAMP,
+                            last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                             wallet VARCHAR(42),
                             referred_by VARCHAR(32),
                             join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
@@ -220,25 +220,29 @@ class SUIBot:
 
         async with self.db_pool.connection() as conn:
             async with conn.cursor() as cur:
-                # Optimized SELECT query with specific columns
                 await cur.execute("""
                     SELECT user_id, username, balance, total_earned, referrals,
                            last_claim, last_daily, wallet, referred_by, join_date
                     FROM users 
                     WHERE user_id = %s
                 """, (user_id,))
-                row = await cur.fetchone()
-                if row:
-                    # Convert Decimal objects to strings for consistency
-                    row['balance'] = str(row['balance'])
-                    row['total_earned'] = str(row['total_earned'])
-                    # Convert datetime objects to ISO format strings
-                    row['last_claim'] = row['last_claim'].isoformat()
-                    row['last_daily'] = row['last_daily'].isoformat()
-                    row['join_date'] = row['join_date'].isoformat()
+                
+                result = await cur.fetchone()
+                if result:
+                    # Convertir el resultado a diccionario
+                    user_data = dict(result)
                     
-                    self.user_cache[user_id] = row
-                    return row
+                    # Convertir Decimal a string
+                    user_data['balance'] = str(user_data['balance'])
+                    user_data['total_earned'] = str(user_data['total_earned'])
+                    
+                    # Convertir datetime a ISO string
+                    for field in ['last_claim', 'last_daily', 'join_date']:
+                        if user_data[field]:
+                            user_data[field] = user_data[field].isoformat()
+                    
+                    self.user_cache[user_id] = user_data
+                    return user_data
         return None
 
     async def _notify_referrer(self, bot, referrer_id):
@@ -660,11 +664,10 @@ class SUIBot:
             try:
                 async with self.db_pool.connection() as conn:
                     async with conn.cursor() as cur:
-                        # Get total count of users
-                        await cur.execute("SELECT COUNT(*) FROM users")
-                        total_users = (await cur.fetchone())['COUNT(*)']
+                        await cur.execute("SELECT COUNT(*) as count FROM users")
+                        result = await cur.fetchone()
+                        total_users = result['count']
                         
-                        # Process in batches
                         for offset in range(0, total_users, BATCH_SIZE):
                             await cur.execute("""
                                 SELECT user_id, last_claim, last_daily 
@@ -672,8 +675,9 @@ class SUIBot:
                                 LIMIT %s OFFSET %s
                             """, (BATCH_SIZE, offset))
                             
-                            batch = await cur.fetchall()
-                            for user_data in batch:
+                            rows = await cur.fetchall()
+                            for row in rows:
+                                user_data = dict(row)
                                 user_id = user_data["user_id"]
                                 
                                 # Check daily bonus
@@ -717,13 +721,18 @@ async def main():
         # Initialize bot
         bot = SUIBot()
         
-        # Initialize database
-        try:
-            await bot.init_db()
-        except Exception as e:
-            logger.error(f"Failed to initialize database: {str(e)}")
-            return
-            
+        # Initialize database with retry
+        retry_count = 3
+        for attempt in range(retry_count):
+            try:
+                await bot.init_db()
+                break
+            except Exception as e:
+                logger.error(f"Database initialization attempt {attempt + 1} failed: {str(e)}")
+                if attempt == retry_count - 1:
+                    raise
+                await asyncio.sleep(5)
+        
         # Optimize database
         try:
             await bot.db_pool.optimize_db()

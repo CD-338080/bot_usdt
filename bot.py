@@ -785,8 +785,8 @@ class SUIBot:
                 with conn.cursor(cursor_factory=DictCursor) as cur:
                     cur.execute("""
                         SELECT user_id, 
-                               last_claim AT TIME ZONE 'UTC' as last_claim, 
-                               last_daily AT TIME ZONE 'UTC' as last_daily 
+                               last_claim,
+                               last_daily
                         FROM users 
                         WHERE last_claim < NOW() - INTERVAL '5 minutes'
                         OR last_daily < NOW() - INTERVAL '24 hours'
@@ -800,13 +800,19 @@ class SUIBot:
                             last_claim = row['last_claim']
                             last_daily = row['last_daily']
                             
-                            now = datetime.now()
+                            # Asegurarnos de que now esté en UTC
+                            now = datetime.utcnow()
                             
-                            # Convertir timestamps a datetime si no lo son
-                            if isinstance(last_claim, str):
-                                last_claim = datetime.fromisoformat(last_claim.replace('Z', '+00:00'))
-                            if isinstance(last_daily, str):
-                                last_daily = datetime.fromisoformat(last_daily.replace('Z', '+00:00'))
+                            # Convertir last_claim y last_daily a UTC naive
+                            if isinstance(last_claim, datetime):
+                                last_claim = last_claim.replace(tzinfo=None)
+                            else:
+                                continue
+                            
+                            if isinstance(last_daily, datetime):
+                                last_daily = last_daily.replace(tzinfo=None)
+                            else:
+                                continue
 
                             if now - last_daily > timedelta(days=1):
                                 await self.application.bot.send_message(

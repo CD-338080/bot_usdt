@@ -639,6 +639,78 @@ class SUIBot:
             message = ' '.join(context.args[1:])
             await self.handle_mailing(update, context)
 
+    async def get_user(self, user_id: str) -> Optional[Dict]:
+        """Get user data from cache or database"""
+        # Check cache first
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+        
+        # Get from database
+        try:
+            async with self.db_pool.connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cur:
+                    cur.execute("""
+                        SELECT user_id, username, balance, total_earned, 
+                               referrals, last_claim, last_daily, wallet, 
+                               referred_by, join_date
+                        FROM users 
+                        WHERE user_id = %s
+                    """, (user_id,))
+                    
+                    result = cur.fetchone()
+                    if result:
+                        # Convert to dict and cache
+                        user_data = dict(result)
+                        # Convert datetime to ISO format string
+                        user_data["last_claim"] = user_data["last_claim"].isoformat() if user_data["last_claim"] else None
+                        user_data["last_daily"] = user_data["last_daily"].isoformat() if user_data["last_daily"] else None
+                        user_data["join_date"] = user_data["join_date"].isoformat() if user_data["join_date"] else None
+                        # Cache the result
+                        self.user_cache[user_id] = user_data
+                        return user_data
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Error getting user {user_id}: {e}")
+            return None
+
+    async def save_user(self, user_data: dict):
+        """Save user data to database"""
+        try:
+            async with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        INSERT INTO users 
+                        (user_id, username, balance, total_earned, referrals, 
+                        last_claim, last_daily, wallet, referred_by, join_date)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        ON CONFLICT (user_id) DO UPDATE SET
+                        username = EXCLUDED.username,
+                        balance = EXCLUDED.balance,
+                        total_earned = EXCLUDED.total_earned,
+                        referrals = EXCLUDED.referrals,
+                        last_claim = EXCLUDED.last_claim,
+                        last_daily = EXCLUDED.last_daily,
+                        wallet = EXCLUDED.wallet,
+                        referred_by = EXCLUDED.referred_by
+                    """, (
+                        user_data["user_id"],
+                        user_data["username"],
+                        str(Decimal(user_data["balance"])),
+                        str(Decimal(user_data["total_earned"])),
+                        user_data["referrals"],
+                        datetime.fromisoformat(user_data["last_claim"]) if user_data["last_claim"] else None,
+                        datetime.fromisoformat(user_data["last_daily"]) if user_data["last_daily"] else None,
+                        user_data.get("wallet"),
+                        user_data.get("referred_by"),
+                        datetime.fromisoformat(user_data.get("join_date", datetime.now(UTC).isoformat()))
+                    ))
+                    conn.commit()
+                    self.user_cache[user_data["user_id"]] = user_data.copy()
+        except Exception as e:
+            logger.error(f"Error saving user: {e}")
+            raise
+
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")

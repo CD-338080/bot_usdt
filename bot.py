@@ -220,8 +220,8 @@ class SUIBot:
         self.notification_task = asyncio.create_task(self.start_notification_task())
 
     async def start_notification_task(self):
-        """Notification task with improved connection handling"""
-        BATCH_SIZE = 100  # Reducido para mejor manejo
+        """Notification task with timezone handling"""
+        BATCH_SIZE = 100
         notification_cache = {}
         
         while True:
@@ -230,7 +230,9 @@ class SUIBot:
                 async with self.db_pool.connection() as conn:
                     with conn.cursor(cursor_factory=DictCursor) as cur:
                         cur.execute("""
-                            SELECT user_id, last_claim, last_daily
+                            SELECT user_id, 
+                                   last_claim AT TIME ZONE 'UTC' as last_claim,
+                                   last_daily AT TIME ZONE 'UTC' as last_daily
                             FROM users 
                             WHERE last_claim < NOW() - INTERVAL '5 minutes'
                             OR last_daily < NOW() - INTERVAL '24 hours'
@@ -243,14 +245,14 @@ class SUIBot:
                         for row in rows:
                             try:
                                 user_id = row['user_id']
-                                last_claim = row['last_claim']
-                                last_daily = row['last_daily']
+                                last_claim = row['last_claim'].replace(tzinfo=UTC)
+                                last_daily = row['last_daily'].replace(tzinfo=UTC)
                                 
                                 # Verificar notificaciones
-                                if now - last_daily > timedelta(days=1):
+                                if (now - last_daily) > timedelta(days=1):
                                     cache_key = f"{user_id}_daily"
                                     if cache_key not in notification_cache or \
-                                       now - notification_cache[cache_key] > timedelta(hours=23):
+                                       (now - notification_cache[cache_key]) > timedelta(hours=23):
                                         try:
                                             await self.application.bot.send_message(
                                                 chat_id=user_id,
@@ -260,10 +262,10 @@ class SUIBot:
                                         except Exception as e:
                                             logger.error(f"Failed to send daily notification to {user_id}: {e}")
 
-                                if now - last_claim > timedelta(minutes=5):
+                                if (now - last_claim) > timedelta(minutes=5):
                                     cache_key = f"{user_id}_claim"
                                     if cache_key not in notification_cache or \
-                                       now - notification_cache[cache_key] > timedelta(minutes=4):
+                                       (now - notification_cache[cache_key]) > timedelta(minutes=4):
                                         try:
                                             await self.application.bot.send_message(
                                                 chat_id=user_id,
@@ -272,8 +274,8 @@ class SUIBot:
                                             notification_cache[cache_key] = now
                                         except Exception as e:
                                             logger.error(f"Failed to send claim notification to {user_id}: {e}")
-                                            
-                                await asyncio.sleep(0.1)  # Prevenir flood
+                                        
+                                await asyncio.sleep(0.1)
                                 
                             except Exception as e:
                                 logger.error(f"Error processing notification for {user_id}: {e}")
@@ -285,9 +287,9 @@ class SUIBot:
                 # Limpiar cache antigua
                 current_time = datetime.now(UTC)
                 notification_cache = {k: v for k, v in notification_cache.items() 
-                                   if current_time - v < timedelta(days=1)}
+                                   if (current_time - v) < timedelta(days=1)}
                 
-                await asyncio.sleep(30)  # Reducido el tiempo de espera
+                await asyncio.sleep(30)
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from database"""

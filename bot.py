@@ -508,7 +508,7 @@ class USDTBot:
                     f"──────────────────\n"
                     f"💎 While you wait:\n"
                     f"• 💸 Use COLLECT every 5min\n"
-                    f"• �� Invite friends: +10 USDT each\n"
+                    f"• 💚 Invite friends: +10 USDT each\n"
                     f"• 📈 Check the leaderboard\n"
                     f"──────────────────\n"
                     f"🔔 Come back tomorrow for 25 USDT!"
@@ -549,7 +549,7 @@ class USDTBot:
 
     async def handle_balance(self, update: Update, user_data: dict):
         await update.message.reply_text(
-            f"�� Your Statistics:\n"
+            f"💚 Your Statistics:\n"
             f"──────────────────\n"
             f"💰 Balance: {user_data['balance']} USDT\n"
             f"🤝 Community: {user_data['referrals']}\n"

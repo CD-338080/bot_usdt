@@ -252,7 +252,7 @@ class SUIBot:
             '/stats': self.handle_stats,
             '/mailing': self.handle_mailing,
             '/broadcast': self.handle_mailing,  # alias para mailing
-            '/start_admin': self.handle_admin_start
+            '/admin': self.handle_admin  # cambiado de start_admin a admin
         }
 
     async def init_db(self):
@@ -905,6 +905,26 @@ class SUIBot:
         """Check if user is admin"""
         return str(user_id) == self.admin_id
 
+    async def handle_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle admin panel command"""
+        if not await self.is_admin(str(update.effective_user.id)):
+            await self.handle_unknown(update, context)
+            return
+
+        admin_menu = (
+            "👨‍💻 Admin Panel\n"
+            "──────────────────\n"
+            "📊 Commands:\n"
+            "/stats - View statistics\n"
+            "/mailing <message> - Send mass message\n"
+            "/mailing stop - Stop mailing\n"
+            "/mailing status - Check mailing status\n"
+            "──────────────────\n"
+            "🤖 Bot Status: Online"
+        )
+        
+        await update.message.reply_text(admin_menu)
+
     async def set_bot_commands(self, context: ContextTypes.DEFAULT_TYPE):
         """Set bot commands based on user role"""
         # Comandos para usuarios normales (ninguno visible)
@@ -915,7 +935,7 @@ class SUIBot:
             ('stats', 'View bot statistics'),
             ('mailing', 'Send mass message to users'),
             ('broadcast', 'Alias for mailing'),
-            ('start_admin', 'Admin panel')
+            ('admin', 'Admin control panel')
         ]
         
         # Configurar comandos de admin solo visibles para el admin
@@ -933,7 +953,7 @@ def main():
     asyncio.get_event_loop().run_until_complete(bot.init_db())
 
     # Add handlers
-    application.add_handler(CommandHandler(["start", "start_admin", "stats", "mailing", "broadcast"], bot.handle_command))
+    application.add_handler(CommandHandler(["start", "admin", "stats", "mailing", "broadcast"], bot.handle_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown))
     

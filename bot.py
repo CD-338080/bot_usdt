@@ -629,15 +629,168 @@ class SUIBot:
         """Handle admin commands"""
         user_id = str(update.effective_user.id)
         if user_id != self.admin_id:
+            await update.message.reply_text("❌ You are not authorized to use admin commands.")
             return
 
-        command = context.args[0] if context.args else ""
-        
-        if command == "stats":
-            await self.handle_stats(update, context)
-        elif command == "mailing":
-            message = ' '.join(context.args[1:])
-            await self.handle_mailing(update, context)
+        if not context.args:
+            await update.message.reply_text(
+                "📋 Admin Commands:\n"
+                "/admin stats - Show bot statistics\n"
+                "/admin broadcast - Send message to all users\n"
+                "/admin addbalance - Add balance to user\n"
+                "/admin removeuser - Remove user from bot"
+            )
+            return
+
+        command = context.args[0].lower()
+
+        try:
+            if command == "stats":
+                await self.handle_admin_stats(update)
+            elif command == "broadcast":
+                message = ' '.join(context.args[1:])
+                await self.handle_admin_broadcast(update, message)
+            elif command == "addbalance":
+                if len(context.args) != 3:
+                    await update.message.reply_text("❌ Usage: /admin addbalance <user_id> <amount>")
+                    return
+                user_id = context.args[1]
+                amount = context.args[2]
+                await self.handle_admin_add_balance(update, user_id, amount)
+            elif command == "removeuser":
+                if len(context.args) != 2:
+                    await update.message.reply_text("❌ Usage: /admin removeuser <user_id>")
+                    return
+                user_id = context.args[1]
+                await self.handle_admin_remove_user(update, user_id)
+            else:
+                await update.message.reply_text("❌ Unknown admin command")
+        except Exception as e:
+            logger.error(f"Admin command error: {e}")
+            await update.message.reply_text("❌ Error executing admin command")
+
+    async def handle_admin_stats(self, update: Update):
+        """Handle admin stats command"""
+        try:
+            async with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    # Total users
+                    cur.execute("SELECT COUNT(*) FROM users")
+                    total_users = cur.fetchone()[0]
+
+                    # Total balance
+                    cur.execute("SELECT SUM(CAST(balance AS DECIMAL)) FROM users")
+                    total_balance = cur.fetchone()[0] or 0
+
+                    # Active users (last 24h)
+                    cur.execute("""
+                        SELECT COUNT(*) FROM users 
+                        WHERE last_claim > NOW() - INTERVAL '24 hours'
+                    """)
+                    active_users = cur.fetchone()[0]
+
+                    # Total withdrawals
+                    cur.execute("SELECT SUM(CAST(total_earned AS DECIMAL)) FROM users")
+                    total_earned = cur.fetchone()[0] or 0
+
+                    await update.message.reply_text(
+                        f"📊 Bot Statistics\n"
+                        f"──────────────────\n"
+                        f"👥 Total Users: {total_users:,}\n"
+                        f"📱 Active Users (24h): {active_users:,}\n"
+                        f"💰 Total Balance: {total_balance:.2f} SUI\n"
+                        f"💎 Total Earned: {total_earned:.2f} SUI\n"
+                        f"──────────────────"
+                    )
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            await update.message.reply_text("❌ Error getting statistics")
+
+    async def handle_admin_broadcast(self, update: Update, message: str):
+        """Handle admin broadcast command"""
+        if not message:
+            await update.message.reply_text("❌ Please provide a message to broadcast")
+            return
+
+        try:
+            async with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT user_id FROM users")
+                    users = cur.fetchall()
+
+                    sent = 0
+                    failed = 0
+                    for user in users:
+                        try:
+                            await self.application.bot.send_message(
+                                chat_id=user[0],
+                                text=f"📢 Announcement\n──────────────────\n{message}"
+                            )
+                            sent += 1
+                            await asyncio.sleep(0.05)  # Prevent flood
+                        except Exception:
+                            failed += 1
+
+                    await update.message.reply_text(
+                        f"📨 Broadcast Results\n"
+                        f"──────────────────\n"
+                        f"✅ Sent: {sent}\n"
+                        f"❌ Failed: {failed}\n"
+                        f"📝 Total: {sent + failed}"
+                    )
+        except Exception as e:
+            logger.error(f"Broadcast error: {e}")
+            await update.message.reply_text("❌ Error sending broadcast")
+
+    async def handle_admin_add_balance(self, update: Update, target_user_id: str, amount: str):
+        """Handle admin add balance command"""
+        try:
+            amount = Decimal(amount)
+            if amount <= 0:
+                await update.message.reply_text("❌ Amount must be positive")
+                return
+
+            user_data = await self.get_user(target_user_id)
+            if not user_data:
+                await update.message.reply_text("❌ User not found")
+                return
+
+            # Update balance
+            user_data["balance"] = str(Decimal(user_data["balance"]) + amount)
+            await self.save_user(user_data)
+
+            await update.message.reply_text(
+                f"✅ Balance Added\n"
+                f"──────────────────\n"
+                f"👤 User: {user_data['username']}\n"
+                f"💰 Added: {amount} SUI\n"
+                f"💎 New Balance: {user_data['balance']} SUI"
+            )
+        except ValueError:
+            await update.message.reply_text("❌ Invalid amount")
+        except Exception as e:
+            logger.error(f"Add balance error: {e}")
+            await update.message.reply_text("❌ Error adding balance")
+
+    async def handle_admin_remove_user(self, update: Update, target_user_id: str):
+        """Handle admin remove user command"""
+        try:
+            async with self.db_pool.connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM users WHERE user_id = %s RETURNING username", (target_user_id,))
+                    result = cur.fetchone()
+                    conn.commit()
+
+                    if result:
+                        username = result[0]
+                        if target_user_id in self.user_cache:
+                            del self.user_cache[target_user_id]
+                        await update.message.reply_text(f"✅ User @{username} removed successfully")
+                    else:
+                        await update.message.reply_text("❌ User not found")
+        except Exception as e:
+            logger.error(f"Remove user error: {e}")
+            await update.message.reply_text("❌ Error removing user")
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from cache or database"""

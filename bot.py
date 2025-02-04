@@ -82,36 +82,31 @@ class DatabasePool:
         if not self._initialized:
             try:
                 self.conn = self.get_connection()
-                await self._initialize_tables()
+                with self.conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS users (
+                            user_id VARCHAR(32) PRIMARY KEY,
+                            username VARCHAR(64),
+                            balance NUMERIC(20,8) DEFAULT 0,
+                            total_earned NUMERIC(20,8) DEFAULT 0,
+                            referrals INT DEFAULT 0,
+                            last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            wallet VARCHAR(42),
+                            referred_by VARCHAR(32),
+                            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                    """)
                 self._initialized = True
-                logger.info("Database connection established successfully")
+                logger.info("Database tables initialized successfully")
             except Exception as e:
                 logger.error(f"Database initialization failed: {str(e)}")
                 raise
 
-    async def _initialize_tables(self):
-        """Initialize database tables"""
-        conn = self.get_connection()
-        with conn.cursor() as cur:
-            try:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id VARCHAR(32) PRIMARY KEY,
-                        username VARCHAR(64),
-                        balance NUMERIC(20,8) DEFAULT 0,
-                        total_earned NUMERIC(20,8) DEFAULT 0,
-                        referrals INT DEFAULT 0,
-                        last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        wallet VARCHAR(42),
-                        referred_by VARCHAR(32),
-                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """)
-                logger.info("Database tables initialized successfully")
-            except Exception as e:
-                logger.error(f"Failed to initialize tables: {str(e)}")
-                raise
+    async def close(self):
+        """Close database connection"""
+        if self.conn:
+            self.conn.close()
 
     @asynccontextmanager
     async def connection(self):
@@ -163,12 +158,6 @@ class DatabasePool:
         async with self.conn.cursor() as cur:
             # Cambiado a comandos PostgreSQL
             cur.execute("VACUUM ANALYZE users")
-
-    async def close(self):
-        """Close the database pool"""
-        if self.conn:
-            self.conn.close()
-            self._initialized = False
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from cache or database"""
@@ -656,7 +645,7 @@ class SUIBot:
         BATCH_SIZE = 1000
         while True:
             try:
-                conn = self.db_pool.get_connection()
+                conn = self.get_connection()
                 with conn.cursor(cursor_factory=DictCursor) as cur:
                     cur.execute("SELECT COUNT(*) as count FROM users")
                     result = cur.fetchone()
@@ -674,16 +663,18 @@ class SUIBot:
                             user_data = dict(row)
                             user_id = user_data["user_id"]
                             
-                            # Process notifications...
-                            await self._process_notifications(user_id, user_data)
+                            try:
+                                await self._process_notifications(user_id, user_data)
+                            except Exception as e:
+                                logger.error(f"Error processing notification for {user_id}: {e}")
                             await asyncio.sleep(0.05)
                         
                         await asyncio.sleep(1)
                         
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
-            
-            await asyncio.sleep(300)
+            finally:
+                await asyncio.sleep(300)  # 5 minutes delay between checks
 
     async def _process_notifications(self, user_id: str, user_data: dict):
         """Process notifications for a single user"""
@@ -708,7 +699,6 @@ class SUIBot:
 
 async def main():
     """Initialize and start the bot with proper error handling"""
-    # Initialize logging
     logging.basicConfig(
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         level=logging.INFO
@@ -740,15 +730,15 @@ async def main():
         # Add error handler
         application.add_error_handler(error_handler)
         
+        # Start notification task
+        asyncio.create_task(bot.start_notification_task())
+        
         logger.info("Bot started successfully!")
         
-        # Start polling with clean startup
-        await application.initialize()
-        await application.start()
+        # Start polling
         await application.run_polling(
             drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False
+            allowed_updates=Update.ALL_TYPES
         )
         
     except Exception as e:
@@ -772,31 +762,10 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     try:
-        # Clean up any existing event loops
-        try:
-            loop = asyncio.get_event_loop()
-            if loop.is_running():
-                loop.stop()
-                loop.close()
-        except Exception:
-            pass
-        
-        # Create new event loop
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        
-        # Apply nest_asyncio
-        nest_asyncio.apply()
-        
         # Run the bot
-        loop.run_until_complete(main())
+        asyncio.run(main())
     except KeyboardInterrupt:
         logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)
-    finally:
-        try:
-            loop.close()
-        except Exception:
-            pass

@@ -15,6 +15,7 @@ import psycopg2
 from psycopg2.extras import DictCursor
 from urllib.parse import urlparse
 from signal import signal, SIGINT, SIGTERM, SIGABRT
+import time
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -229,15 +230,18 @@ class SUIBot:
         """Save user data to database"""
         await self.db_pool.save_user(user_data)
 
-    async def _notify_referrer(self, bot, referrer_id):
-        """Separate notification function for better performance"""
+    async def _notify_referrer(self, bot, referrer_id: str):
+        """Notify referrer about new referral"""
         try:
             await bot.send_message(
                 chat_id=referrer_id,
-                text=f"👥 New referral! +{REWARDS['referral']} SUI!"
+                text=(
+                    f"👥 New referral joined!\n"
+                    f"💰 You earned {REWARDS['referral']} SUI!"
+                )
             )
         except Exception as e:
-            logger.error(f"Referral notification failed: {e}")
+            logger.error(f"Failed to notify referrer {referrer_id}: {e}")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Start command handler"""
@@ -251,6 +255,7 @@ class SUIBot:
             user_data = await self.get_user(user_id)
             
             if not user_data:
+                # Initialize new user data
                 user_data = {
                     "user_id": user_id,
                     "username": username,
@@ -265,68 +270,42 @@ class SUIBot:
                 }
 
                 # Process referral
-                if context.args and isinstance(context.args, list) and len(context.args) > 0:
-                    try:
-                        referrer_id = context.args[0]
-                        logger.info(f"Processing referral: new user {user_id} referred by {referrer_id}")
+                if context.args and len(context.args) > 0:
+                    referrer_id = context.args[0]
+                    
+                    if referrer_id != user_id:  # Prevent self-referral
+                        referrer_data = await self.get_user(referrer_id)
                         
-                        if referrer_id != user_id:  # Prevent self-referral
-                            # Get referrer data first
-                            referrer_data = await self.get_user(referrer_id)
-                            
-                            if referrer_data:
-                                logger.info(f"Found referrer {referrer_id}")
+                        if referrer_data:
+                            # Update new user with referral bonus
+                            user_data["balance"] = str(REWARDS["referral"])
+                            user_data["total_earned"] = str(REWARDS["referral"])
+                            user_data["referred_by"] = referrer_id
+
+                            # Save new user first
+                            await self.save_user(user_data)
+
+                            try:
+                                # Update referrer's data
+                                referrer_data["balance"] = str(Decimal(referrer_data["balance"]) + REWARDS["referral"])
+                                referrer_data["total_earned"] = str(Decimal(referrer_data["total_earned"]) + REWARDS["referral"])
+                                referrer_data["referrals"] = referrer_data["referrals"] + 1
+
+                                # Save referrer's updated data
+                                await self.save_user(referrer_data)
+
+                                # Notify referrer
+                                await self._notify_referrer(context.bot, referrer_id)
                                 
-                                # Set up new user with bonus
-                                user_data["balance"] = str(REWARDS["referral"])
-                                user_data["total_earned"] = str(REWARDS["referral"])
-                                user_data["referred_by"] = referrer_id
-
-                                # Save new user first
-                                await self.save_user(user_data)
-                                logger.info(f"Saved new user {user_id} with referral bonus")
-
-                                try:
-                                    # Update referrer
-                                    new_balance = Decimal(referrer_data["balance"]) + REWARDS["referral"]
-                                    new_total = Decimal(referrer_data["total_earned"]) + REWARDS["referral"]
-                                    
-                                    async with self.db_pool.connection() as conn:
-                                        async with conn.cursor() as cur:
-                                            await cur.execute("""
-                                                UPDATE users 
-                                                SET 
-                                                    referrals = referrals + 1,
-                                                    balance = %s,
-                                                    total_earned = %s
-                                                WHERE user_id = %s
-                                            """, (
-                                                str(new_balance),
-                                                str(new_total),
-                                                referrer_id
-                                            ))
-                                    logger.info(f"Updated referrer {referrer_id} balance")
-
-                                    # Clear referrer cache
-                                    self.user_cache.pop(referrer_id, None)
-
-                                    # Notify referrer asynchronously
-                                    asyncio.create_task(self._notify_referrer(context.bot, referrer_id))
-                                
-                                except Exception as e:
-                                    logger.error(f"Error updating referrer: {e}")
-                                    # Continue execution - user is already saved
-                            else:
-                                logger.warning(f"Referrer {referrer_id} not found")
-                    except Exception as e:
-                        logger.error(f"Error processing referral: {e}")
+                            except Exception as e:
+                                logger.error(f"Error updating referrer: {e}")
                 else:
                     # Save new user without referral
                     await self.save_user(user_data)
 
-            # Send welcome message asynchronously
+            # Send welcome message
             welcome_msg = self._get_welcome_message(user_data)
-            asyncio.create_task(update.message.reply_text(welcome_msg, reply_markup=self._keyboard))
+            await update.message.reply_text(welcome_msg, reply_markup=self._keyboard)
 
         except Exception as e:
             logger.error(f"Critical error in start handler: {str(e)}")
@@ -683,6 +662,35 @@ class SUIBot:
             finally:
                 await asyncio.sleep(300)  # Wait 5 minutes before next check
 
+    async def handle_invite(self, update: Update):
+        """Handle invite command"""
+        if not update.message:
+            return
+        
+        user_id = str(update.effective_user.id)
+        bot_username = (await update.get_bot()).username
+        
+        try:
+            user_data = await self.get_user(user_id)
+            if not user_data:
+                await update.message.reply_text("⚠️ Please start the bot first with /start")
+                return
+
+            referral_link = f"https://t.me/{bot_username}?start={user_id}"
+            referrals = user_data.get("referrals", 0)
+            earned = Decimal(user_data.get("total_earned", "0"))
+            
+            await update.message.reply_text(
+                f"🤝 Share your referral link:\n"
+                f"{referral_link}\n\n"
+                f"👥 Your referrals: {referrals}\n"
+                f"💰 Earned from referrals: {earned} SUI\n\n"
+                f"💎 Earn {REWARDS['referral']} SUI for each referral!"
+            )
+        except Exception as e:
+            logger.error(f"Error in invite handler: {e}")
+            await update.message.reply_text("❌ An error occurred!")
+
 async def main():
     """Initialize and start the bot"""
     try:
@@ -690,8 +698,18 @@ async def main():
         bot = SUIBot()
         await bot.init_db()
         
-        # Initialize application
-        application = Application.builder().token(bot.token).build()
+        # Initialize application with better error handling
+        application = (
+            Application.builder()
+            .token(bot.token)
+            .connect_timeout(30)  # Increased timeout
+            .read_timeout(30)
+            .write_timeout(30)
+            .get_updates_connect_timeout(30)
+            .get_updates_read_timeout(30)
+            .get_updates_write_timeout(30)
+            .build()
+        )
         bot.application = application
 
         # Add handlers
@@ -702,6 +720,8 @@ async def main():
             filters.TEXT & ~filters.COMMAND,
             bot.handle_message
         ))
+        
+        # Add error handler with retry logic
         application.add_error_handler(error_handler)
         
         # Start notification task
@@ -709,11 +729,14 @@ async def main():
         
         logger.info("Bot started successfully!")
         
-        # Start polling
+        # Start polling with better error handling
         await application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
-            close_loop=False
+            close_loop=False,
+            pool_timeout=30,
+            read_timeout=30,
+            write_timeout=30
         )
         
     except Exception as e:
@@ -721,28 +744,59 @@ async def main():
         raise
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors in the telegram bot."""
-    logger.error(f"Exception while handling an update: {context.error}")
+    """Handle errors in the telegram bot with retry logic."""
+    error = context.error
     
+    # Log the error
+    logger.error(f"Exception while handling an update: {error}")
+    
+    # Handle specific errors
+    if "Conflict: terminated by other getUpdates request" in str(error):
+        logger.info("Detected multiple instance conflict, waiting to stabilize...")
+        await asyncio.sleep(5)  # Wait for other instance to settle
+        return
+    
+    # Notify admin of other errors
     if ADMIN_ID:
         try:
             await context.bot.send_message(
                 chat_id=ADMIN_ID,
-                text=f"❌ Error in bot: {context.error}"
+                text=f"❌ Error in bot: {error}"
             )
         except Exception as e:
             logger.error(f"Failed to send error message to admin: {e}")
 
 if __name__ == "__main__":
+    # Configure logging
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
+    )
+    
     # Set up signal handlers
     for sig in (SIGINT, SIGTERM, SIGABRT):
         signal(sig, lambda s, f: sys.exit(0))
     
-    # Run the bot
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
-    except Exception as e:
-        logger.error(f"Fatal error: {e}")
-        sys.exit(1)
+    # Apply nest_asyncio
+    nest_asyncio.apply()
+    
+    # Run the bot with retry logic
+    retry_count = 0
+    max_retries = 3
+    
+    while retry_count < max_retries:
+        try:
+            asyncio.run(main())
+            break
+        except (KeyboardInterrupt, SystemExit):
+            logger.info("Bot stopped")
+            break
+        except Exception as e:
+            retry_count += 1
+            logger.error(f"Error (attempt {retry_count}/{max_retries}): {e}")
+            if retry_count < max_retries:
+                logger.info(f"Retrying in 5 seconds...")
+                time.sleep(5)
+            else:
+                logger.error("Max retries reached, exiting.")
+                sys.exit(1)

@@ -178,7 +178,7 @@ class SUIBot:
             '/stats': self.handle_stats,
             '/mailing': self.handle_mailing,
             '/broadcast': self.handle_mailing,  # alias para mailing
-            '/admin': self.handle_admin  # cambiado de start_admin a admin
+            '/admin': self.handle_admin
         }
 
     async def init_db(self):
@@ -716,6 +716,69 @@ class SUIBot:
             "──────────────────\n"
             "Need help? Use ❓ Info button"
         )
+
+    async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle admin stats command"""
+        if not await self.is_admin(str(update.effective_user.id)):
+            await self.handle_unknown(update, context)
+            return
+
+        conn = None
+        try:
+            conn = await self.db_pool.get_connection()
+            with conn.cursor() as cur:
+                # Total users
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
+
+                # Active users (last 24h)
+                cur.execute("""
+                    SELECT COUNT(*) FROM users 
+                    WHERE last_claim > NOW() - INTERVAL '24 hours'
+                    OR last_daily > NOW() - INTERVAL '24 hours'
+                """)
+                active_users = cur.fetchone()[0]
+
+                # Total SUI distributed
+                cur.execute("SELECT SUM(CAST(total_earned AS DECIMAL)) FROM users")
+                total_sui = cur.fetchone()[0] or 0
+
+                # Total referrals
+                cur.execute("SELECT SUM(referrals) FROM users")
+                total_referrals = cur.fetchone()[0] or 0
+
+                # Users with wallet
+                cur.execute("SELECT COUNT(*) FROM users WHERE wallet IS NOT NULL")
+                users_with_wallet = cur.fetchone()[0]
+
+                # Today's new users
+                cur.execute("""
+                    SELECT COUNT(*) FROM users 
+                    WHERE join_date::date = CURRENT_DATE
+                """)
+                new_users_today = cur.fetchone()[0]
+
+                stats_message = (
+                    "📊 Bot Statistics\n"
+                    "──────────────────\n"
+                    f"👥 Total Users: {total_users:,}\n"
+                    f"📱 Active (24h): {active_users:,}\n"
+                    f"🆕 New Today: {new_users_today:,}\n"
+                    f"💰 Total SUI Distributed: {total_sui:,.2f}\n"
+                    f"🔗 Total Referrals: {total_referrals:,}\n"
+                    f"🏦 Users with Wallet: {users_with_wallet:,}\n"
+                    "──────────────────\n"
+                    f"📅 {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
+                )
+
+                await update.message.reply_text(stats_message)
+
+        except Exception as e:
+            logger.error(f"Error getting stats: {e}")
+            await update.message.reply_text("❌ Error getting statistics")
+        finally:
+            if conn:
+                self.db_pool.put_connection(conn)
 
 def main():
     """Start the bot"""

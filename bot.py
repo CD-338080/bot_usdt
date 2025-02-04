@@ -36,17 +36,33 @@ logger = logging.getLogger(__name__)
 
 # Bot configuration
 TOKEN = os.getenv('BOT_TOKEN')
+if not TOKEN:
+    print("Trying alternative token variable name...")
+    TOKEN = os.getenv('TOKEN')  # Intentar con el nombre alternativo
+
 ADMIN_ID = os.getenv('ADMIN_ID')
 USDT_ADDRESS = os.getenv('USDT_ADDRESS')
 
 # Debug logging
 print("\nEnvironment variables:")
-print(f"BOT_TOKEN: {TOKEN}")
+print(f"BOT_TOKEN/TOKEN: {TOKEN}")
 print(f"ADMIN_ID: {ADMIN_ID}")
 print(f"USDT_ADDRESS: {USDT_ADDRESS}")
 
+# Lista todas las variables de entorno disponibles (sin valores sensibles)
+print("\nAvailable environment variables:")
+for key in os.environ.keys():
+    print(f"- {key}")
+
 if not all([TOKEN, ADMIN_ID, USDT_ADDRESS]):
-    raise ValueError("Missing required environment variables")
+    missing = []
+    if not TOKEN:
+        missing.append("BOT_TOKEN/TOKEN")
+    if not ADMIN_ID:
+        missing.append("ADMIN_ID")
+    if not USDT_ADDRESS:
+        missing.append("USDT_ADDRESS")
+    raise ValueError(f"Missing required environment variables: {', '.join(missing)}")
 
 # Rewards system
 REWARDS = {

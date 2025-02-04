@@ -828,7 +828,7 @@ class SUIBot:
             message = ' '.join(context.args[1:])
             await self.handle_mailing(update, context)
 
-def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
     try:
@@ -837,7 +837,7 @@ def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "❌ An error occurred. Please try again later!"
             )
     except Exception as e:
-        logger.error(f"Failed to send error message to admin: {e}")
+        logger.error(f"Failed to send error message: {e}")
 
 def main():
     """Start the bot with improved error handling"""

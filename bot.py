@@ -214,6 +214,8 @@ class SUIBot:
             ["💸 Cash Out", "🔑 SUI Address"],
             ["🏆 Leaders", "❓ Info"]
         ], resize_keyboard=True)
+        
+        self.notification_task = None
 
     async def init_db(self):
         """Initialize database connection"""
@@ -655,42 +657,34 @@ class SUIBot:
                     rows = cur.fetchall()
                     
                     for row in rows:
-                        user_data = dict(row)
                         try:
-                            await self._process_notifications(user_data["user_id"], user_data)
+                            user_data = dict(row)
+                            last_claim = user_data["last_claim"]
+                            last_daily = user_data["last_daily"]
+                            user_id = user_data["user_id"]
+
+                            if datetime.now() - last_daily > timedelta(days=1):
+                                await self.application.bot.send_message(
+                                    chat_id=user_id,
+                                    text="📅 Your daily bonus is ready!\nCome back to claim it!"
+                                )
+                            
+                            if datetime.now() - last_claim > timedelta(hours=1):
+                                await self.application.bot.send_message(
+                                    chat_id=user_id,
+                                    text="🌟 Hey! Collect your bonus\nClaim it now!"
+                                )
                         except Exception as e:
                             logger.error(f"Error processing notification: {e}")
                         await asyncio.sleep(0.05)
-                    
+                        
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
             finally:
-                await asyncio.sleep(300)
-
-    async def _process_notifications(self, user_id: str, user_data: dict):
-        """Process notifications for a single user"""
-        try:
-            # Check daily bonus
-            last_daily = datetime.fromisoformat(user_data["last_daily"])
-            if datetime.now() - last_daily > timedelta(days=1):
-                await self.application.bot.send_message(
-                    chat_id=user_id,
-                    text="📅 Your daily bonus is ready!\nCome back to claim it!"
-                )
-            
-            # Check claim
-            last_claim = datetime.fromisoformat(user_data["last_claim"])
-            if datetime.now() - last_claim > timedelta(hours=1):
-                await self.application.bot.send_message(
-                    chat_id=user_id,
-                    text="🌟 Hey! Collect your bonus\nClaim it now!"
-                )
-        except Exception as e:
-            logger.error(f"Failed to process notifications for {user_id}: {e}")
+                await asyncio.sleep(300)  # Wait 5 minutes before next check
 
 async def main():
     """Initialize and start the bot"""
-    bot = None
     try:
         # Initialize bot and database
         bot = SUIBot()
@@ -711,17 +705,19 @@ async def main():
         application.add_error_handler(error_handler)
         
         # Start notification task
-        notification_task = asyncio.create_task(bot.start_notification_task())
+        bot.notification_task = asyncio.create_task(bot.start_notification_task())
         
         logger.info("Bot started successfully!")
         
         # Start polling
-        await application.run_polling(drop_pending_updates=True)
+        await application.run_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES,
+            close_loop=False
+        )
         
     except Exception as e:
         logger.error(f"Critical error: {e}")
-        if bot and hasattr(bot, 'db_pool'):
-            await bot.db_pool.close()
         raise
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -738,11 +734,15 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             logger.error(f"Failed to send error message to admin: {e}")
 
 if __name__ == "__main__":
+    # Set up signal handlers
+    for sig in (SIGINT, SIGTERM, SIGABRT):
+        signal(sig, lambda s, f: sys.exit(0))
+    
+    # Run the bot
     try:
-        # Run the bot
         asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped by user")
+    except (KeyboardInterrupt, SystemExit):
+        logger.info("Bot stopped")
     except Exception as e:
-        logger.error(f"Fatal error: {str(e)}")
+        logger.error(f"Fatal error: {e}")
         sys.exit(1)

@@ -413,12 +413,19 @@ class USDTBot:
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             
             welcome_text = (
-                f"💎 {'Welcome' if not user_data.get('referred_by') else 'Welcome! +3 USDT Bonus'}\n"
+                f"🌟 {'Welcome to USDT Community!' if not user_data.get('referred_by') else '🎁 Welcome! +5 USDT Bonus Received!'}\n"
                 f"──────────────────\n"
+                f"👤 User: @{user.username or 'Anonymous'}\n"
                 f"💰 Balance: {user_data['balance']} USDT\n"
-                f"🤝 Community: {user_data['referrals']}\n"
+                f"👥 Community: {user_data['referrals']} members\n"
                 f"──────────────────\n"
-                f"Start earning now! 💹"
+                f"💎 Available Rewards:\n"
+                f"• ⚡ Fast Collect: 5 USDT / 5min\n"
+                f"• 🎁 Daily Bonus: 25 USDT / 24h\n"
+                f"• Referrals: 10 USDT each\n"
+                f"──────────────────\n"
+                f"🚀 Start earning now!\n"
+                f"💡 Tip: Use 'COLLECT' every 5 minutes"
             )
             
             await update.message.reply_text(welcome_text, reply_markup=reply_markup)
@@ -439,11 +446,18 @@ class USDTBot:
                 seconds = int(time_left.total_seconds() % 60)
                 
                 await update.message.reply_text(
-                    f"⏳ Next Reward Available In:\n"
+                    f"⏳ Reward Cooldown Active\n"
                     f"──────────────────\n"
-                    f"⌚ {minutes}m {seconds}s\n"
+                    f"⌚ Next Collect in:\n"
+                    f"• ⏱ {minutes}m {seconds}s\n"
                     f"──────────────────\n"
-                    f"💡 Come back later!"
+                    f"💎 While you wait:\n"
+                    f"• 🎁 Check Daily Bonus\n"
+                    f"• 🤝 Share your referral link\n"
+                    f"• 📈 View leaderboard\n"
+                    f"──────────────────\n"
+                    f"🔔 We'll notify you when ready!\n"
+                    f"💡 Tip: Use this time to grow your team"
                 )
                 return
 
@@ -462,12 +476,13 @@ class USDTBot:
             await self.save_user(user_data)
             
             await update.message.reply_text(
-                f"💸 Reward Collected!\n"
+                f"✨ Reward Successfully Claimed!\n"
                 f"──────────────────\n"
-                f"💰 Earned: {REWARDS['claim']} USDT\n"
-                f"💵 Balance: {new_balance:.2f} USDT\n"
+                f"💎 Earned: +{REWARDS['claim']} USDT\n"
+                f"💰 Balance: {new_balance:.2f} USDT\n"
                 f"──────────────────\n"
-                f"⏱ Next reward in 5 minutes"
+                f"⚡ Next claim available in 5min\n"
+                f"💡 Tip: Use Daily Bonus for extra rewards!"
             )
             
         except Exception as e:
@@ -486,11 +501,17 @@ class USDTBot:
                 minutes = int((time_left.total_seconds() % 3600) // 60)
                 
                 await update.message.reply_text(
-                    f"⏳ Next Daily Bonus In:\n"
+                    f"⏳ Daily Bonus Cooldown\n"
                     f"──────────────────\n"
-                    f"⌚ {hours}h {minutes}m\n"
+                    f"🕒 Next bonus available in:\n"
+                    f"• ⌛ {hours}h {minutes}m\n"
                     f"──────────────────\n"
-                    f"💡 Come back tomorrow!"
+                    f"💎 While you wait:\n"
+                    f"• 💸 Use COLLECT every 5min\n"
+                    f"• �� Invite friends: +10 USDT each\n"
+                    f"• 📈 Check the leaderboard\n"
+                    f"──────────────────\n"
+                    f"🔔 Come back tomorrow for 25 USDT!"
                 )
                 return
 
@@ -509,12 +530,17 @@ class USDTBot:
             await self.save_user(user_data)
             
             await update.message.reply_text(
-                f"💵 Daily Bonus Collected!\n"
+                f"🎁 Daily Bonus Claimed!\n"
                 f"──────────────────\n"
-                f"💰 Earned: {REWARDS['daily']} USDT\n"
-                f"💵 Balance: {new_balance:.2f} USDT\n"
+                f"💫 Reward: +{REWARDS['daily']} USDT\n"
+                f"💰 Balance: {new_balance:.2f} USDT\n"
                 f"──────────────────\n"
-                f"⏱ Next bonus in 24 hours"
+                f"💎 Maximize your earnings:\n"
+                f"• ⚡ Use COLLECT every 5min\n"
+                f"• 🤝 Share your referral link\n"
+                f"──────────────────\n"
+                f"⏰ Next daily bonus: 24h\n"
+                f"💡 Don't forget to collect tomorrow!"
             )
             
         except Exception as e:
@@ -523,7 +549,7 @@ class USDTBot:
 
     async def handle_balance(self, update: Update, user_data: dict):
         await update.message.reply_text(
-            f"📊 Your Statistics:\n"
+            f"�� Your Statistics:\n"
             f"──────────────────\n"
             f"💰 Balance: {user_data['balance']} USDT\n"
             f"🤝 Community: {user_data['referrals']}\n"
@@ -802,7 +828,7 @@ class USDTBot:
                     await update.message.reply_text(
                         f"📊 Bot Statistics\n"
                         f"──────────────────\n"
-                        f"🤝 Community: {total_users:,}\n"
+                        f"�� Community: {total_users:,}\n"
                         f"📱 Active Users (24h): {active_users:,}\n"
                         f"💰 Total Balance: {total_balance:.2f} USDT\n"
                         f"💎 Total Earned: {total_earned:.2f} USDT\n"

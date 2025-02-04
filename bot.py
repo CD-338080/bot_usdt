@@ -1,6 +1,6 @@
 from telegram import Update, ReplyKeyboardMarkup, Message
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, UTC
 from decimal import Decimal
 from typing import Optional, Dict
 import logging
@@ -800,8 +800,8 @@ class SUIBot:
                             last_claim = row['last_claim']
                             last_daily = row['last_daily']
                             
-                            # Asegurarnos de que now esté en UTC
-                            now = datetime.utcnow()
+                            # Usar datetime.now(UTC) en lugar de utcnow()
+                            now = datetime.now(UTC).replace(tzinfo=None)
                             
                             # Convertir last_claim y last_daily a UTC naive
                             if isinstance(last_claim, datetime):

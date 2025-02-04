@@ -79,9 +79,9 @@ class DatabasePool:
         self.pool_size = pool_size
         self.max_retries = max_retries
         self.pool = None
-        self._connection_semaphore = asyncio.Semaphore(pool_size // 2)  # Limitar conexiones concurrentes
-        self.user_cache = TTLCache(maxsize=10000, ttl=300)  # Cache para reducir consultas
-        
+        self._connection_semaphore = asyncio.Semaphore(pool_size // 2)
+        self.user_cache = TTLCache(maxsize=10000, ttl=300)
+
     async def initialize(self):
         """Initialize database pool with retry logic"""
         retry_count = 0
@@ -99,11 +99,14 @@ class DatabasePool:
                         connect_timeout=3
                     )
                     
-                    # Verificar conexión
+                    # Verificar conexión e inicializar tablas
                     conn = self.pool.getconn()
-                    self.pool.putconn(conn)
+                    try:
+                        self._initialize_tables(conn)
+                        logger.info("Database tables initialized successfully")
+                    finally:
+                        self.pool.putconn(conn)
                     
-                    await self._initialize_tables()
                     logger.info(f"Database pool initialized with size {self.pool_size}")
                     return
             except Exception as e:
@@ -113,51 +116,42 @@ class DatabasePool:
                     raise
                 await asyncio.sleep(1 * retry_count)
 
-    def _initialize_tables(self):
+    def _initialize_tables(self, conn):
         """Initialize database tables"""
-        try:
-            conn = self.pool.getconn()
-            with conn.cursor() as cur:
+        with conn.cursor() as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    user_id TEXT PRIMARY KEY,
+                    username TEXT,
+                    balance TEXT DEFAULT '0',
+                    total_earned TEXT DEFAULT '0',
+                    referrals INTEGER DEFAULT 0,
+                    referred_by TEXT,
+                    last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    wallet TEXT,
+                    join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (referred_by) REFERENCES users(user_id)
+                )
+            """)
+            # Verificar si la columna join_date existe
+            cur.execute("""
+                SELECT column_name 
+                FROM information_schema.columns 
+                WHERE table_name = 'users' AND column_name = 'join_date'
+            """)
+            if not cur.fetchone():
+                # Si no existe, agregar la columna
                 cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id TEXT PRIMARY KEY,
-                        username TEXT,
-                        balance TEXT DEFAULT '0',
-                        total_earned TEXT DEFAULT '0',
-                        referrals INTEGER DEFAULT 0,
-                        referred_by TEXT,
-                        last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        wallet TEXT,
-                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (referred_by) REFERENCES users(user_id)
-                    )
+                    ALTER TABLE users 
+                    ADD COLUMN join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 """)
-                # Verificar si la columna join_date existe
-                cur.execute("""
-                    SELECT column_name 
-                    FROM information_schema.columns 
-                    WHERE table_name = 'users' AND column_name = 'join_date'
-                """)
-                if not cur.fetchone():
-                    # Si no existe, agregar la columna
-                    cur.execute("""
-                        ALTER TABLE users 
-                        ADD COLUMN join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    """)
-                conn.commit()
-                logger.info("Database tables initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing tables: {e}")
-            raise
-        finally:
-            if conn:
-                self.pool.putconn(conn)
+            conn.commit()
 
     @asynccontextmanager
     async def connection(self):
-        """Mejorado manejo de conexiones con semáforo y retry"""
-        async with self._connection_semaphore:  # Limitar conexiones concurrentes
+        """Get database connection with retry logic"""
+        async with self._connection_semaphore:
             conn = None
             retry_count = 0
             
@@ -166,157 +160,24 @@ class DatabasePool:
                     if not self.pool:
                         await self.initialize()
                     
-                    conn = self.get_connection()
+                    conn = self.pool.getconn()
                     if conn:
-                        conn.autocommit = True
-                        yield conn
-                        return
-                except psycopg2.OperationalError as e:
+                        try:
+                            yield conn
+                            return
+                        finally:
+                            if conn:
+                                self.pool.putconn(conn)
+                except Exception as e:
                     retry_count += 1
-                    logger.warning(f"Connection attempt {retry_count} failed: {e}")
-                    if conn:
-                        try:
-                            self.put_connection(conn)
-                        except:
-                            pass
-                    
-                    # Si el pool está exhausto, intentar reiniciarlo
-                    if "connection pool exhausted" in str(e):
-                        try:
-                            logger.info("Attempting to reinitialize pool...")
-                            self.pool = None
-                            await self.initialize()
-                        except Exception as init_error:
-                            logger.error(f"Pool reinitialization failed: {init_error}")
-                    
+                    logger.error(f"Connection attempt {retry_count} failed: {e}")
                     if retry_count == self.max_retries:
                         raise
-                    await asyncio.sleep(0.5 * retry_count)  # Backoff exponencial
-                finally:
-                    if conn:
-                        self.put_connection(conn)
-
-    def get_connection(self):
-        """Get connection with validation"""
-        if not self.pool:
-            raise Exception("Database pool not initialized")
-        conn = self.pool.getconn()
-        try:
-            # Verificar si la conexión está viva
-            conn.cursor().execute("SELECT 1")
-            return conn
-        except:
-            # Si la conexión está muerta, cerrarla y obtener una nueva
-            try:
-                self.pool.putconn(conn, close=True)
-            except:
-                pass
-            return self.pool.getconn()
-
-    def put_connection(self, conn):
-        """Return connection to pool with safety checks"""
-        if self.pool and conn:
-            try:
-                self.pool.putconn(conn)
-            except Exception as e:
-                logger.error(f"Error returning connection to pool: {e}")
-                try:
-                    conn.close()
-                except:
-                    pass
-
-    async def get_user(self, user_id: str) -> Optional[Dict]:
-        """Get user with connection retry"""
-        # Check cache first
-        if user_id in self.user_cache:
-            return self.user_cache[user_id]
-        
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                async with self.connection() as conn:
-                    with conn.cursor(cursor_factory=DictCursor) as cur:
-                        cur.execute("""
-                            SELECT user_id, username, balance, total_earned, 
-                                   referrals, last_claim, last_daily, wallet, 
-                                   referred_by, COALESCE(join_date, CURRENT_TIMESTAMP) as join_date
-                            FROM users 
-                            WHERE user_id = %s
-                        """, (user_id,))
-                        
-                        result = cur.fetchone()
-                        if result:
-                            user_data = dict(result)
-                            user_data["last_claim"] = user_data["last_claim"].isoformat() if user_data["last_claim"] else None
-                            user_data["last_daily"] = user_data["last_daily"].isoformat() if user_data["last_daily"] else None
-                            user_data["join_date"] = user_data["join_date"].isoformat() if user_data["join_date"] else None
-                            self.user_cache[user_id] = user_data
-                            return user_data
-                        return None
-                        
-            except Exception as e:
-                logger.error(f"Error getting user {user_id}: {e}")
-                if attempt == max_retries - 1:
-                    raise
-                await asyncio.sleep(0.5 * (attempt + 1))
-
-    async def save_user(self, user_data: dict):
-        """Save user with improved connection handling"""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                async with self.connection() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute("""
-                            INSERT INTO users 
-                            (user_id, username, balance, total_earned, referrals, 
-                            last_claim, last_daily, wallet, referred_by, join_date)
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                            ON CONFLICT (user_id) DO UPDATE SET
-                            username = EXCLUDED.username,
-                            balance = EXCLUDED.balance,
-                            total_earned = EXCLUDED.total_earned,
-                            referrals = EXCLUDED.referrals,
-                            last_claim = EXCLUDED.last_claim,
-                            last_daily = EXCLUDED.last_daily,
-                            wallet = EXCLUDED.wallet,
-                            referred_by = EXCLUDED.referred_by
-                        """, (
-                            user_data["user_id"],
-                            user_data["username"],
-                            str(Decimal(user_data["balance"])),
-                            str(Decimal(user_data["total_earned"])),
-                            user_data["referrals"],
-                            datetime.fromisoformat(user_data["last_claim"]) if user_data["last_claim"] else None,
-                            datetime.fromisoformat(user_data["last_daily"]) if user_data["last_daily"] else None,
-                            user_data.get("wallet"),
-                            user_data.get("referred_by"),
-                            datetime.fromisoformat(user_data.get("join_date", datetime.now(UTC).isoformat()))
-                        ))
-                        self.user_cache[user_data["user_id"]] = user_data.copy()
-                        return
-            except psycopg2.OperationalError as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Final save attempt failed: {e}")
-                    raise
-                await asyncio.sleep(0.5 * (attempt + 1))
-            except Exception as e:
-                logger.error(f"Error saving user: {e}")
-                raise
-
-    async def optimize_db(self):
-        """Optimize database performance for PostgreSQL"""
-        async with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                # Cambiado a comandos PostgreSQL
-                cur.execute("VACUUM ANALYZE users")
+                    await asyncio.sleep(0.5 * retry_count)
 
 class USDTBot:
     def __init__(self):
-        self.db_pool = DatabasePool(
-            pool_size=50,  # Aumentado de 20 a 50
-            max_retries=3
-        )
+        self.db_pool = DatabasePool(pool_size=50)
         self.admin_id = str(ADMIN_ID)
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         self.application = None

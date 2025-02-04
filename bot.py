@@ -17,6 +17,7 @@ from psycopg2.pool import SimpleConnectionPool
 from urllib.parse import urlparse
 from signal import signal, SIGINT, SIGTERM, SIGABRT
 import time
+from telegram import BotCommandScopeChat
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -246,6 +247,13 @@ class SUIBot:
         self.mailing_in_progress = False
         self.stop_mailing = False
         self.mailing_task = None
+
+        self.admin_commands = {
+            '/stats': self.handle_stats,
+            '/mailing': self.handle_mailing,
+            '/broadcast': self.handle_mailing,  # alias para mailing
+            '/start_admin': self.handle_admin_start
+        }
 
     async def init_db(self):
         """Initialize database connection"""
@@ -644,7 +652,7 @@ class SUIBot:
     async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle unknown commands and messages"""
         await update.message.reply_text(
-            "❌ Command not found!\n"
+            "❌ Command not recognized\n"
             "──────────────────\n"
             "🔄 Press /start to restart the bot\n"
             "──────────────────\n"
@@ -877,25 +885,44 @@ class SUIBot:
         if not update.message:
             return
 
-        command = update.message.text.split()[0].lower()
         user_id = str(update.effective_user.id)
+        command = update.message.text.split()[0].lower()
 
-        if command == '/stats':
+        # Si es un comando de admin
+        if command in self.admin_commands:
             if await self.is_admin(user_id):
-                await self.handle_stats(update, context)
+                await self.admin_commands[command](update, context)
             else:
+                # Para usuarios normales, fingir que el comando no existe
                 await self.handle_unknown(update, context)
-        elif command == '/mailing':
-            if await self.is_admin(user_id):
-                await self.handle_mailing(update, context)
-            else:
-                await self.handle_unknown(update, context)
+        # Si es /start normal
+        elif command == '/start':
+            await self.start(update, context)
         else:
             await self.handle_unknown(update, context)
 
     async def is_admin(self, user_id: str) -> bool:
         """Check if user is admin"""
         return str(user_id) == self.admin_id
+
+    async def set_bot_commands(self, context: ContextTypes.DEFAULT_TYPE):
+        """Set bot commands based on user role"""
+        # Comandos para usuarios normales (ninguno visible)
+        await context.bot.set_my_commands([])
+        
+        # Comandos solo para admin
+        admin_commands = [
+            ('stats', 'View bot statistics'),
+            ('mailing', 'Send mass message to users'),
+            ('broadcast', 'Alias for mailing'),
+            ('start_admin', 'Admin panel')
+        ]
+        
+        # Configurar comandos de admin solo visibles para el admin
+        await context.bot.set_my_commands(
+            admin_commands,
+            scope=BotCommandScopeChat(chat_id=int(self.admin_id))
+        )
 
 def main():
     """Start the bot"""
@@ -906,13 +933,17 @@ def main():
     asyncio.get_event_loop().run_until_complete(bot.init_db())
 
     # Add handlers
-    application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler(["stats", "mailing"], bot.handle_command))
+    application.add_handler(CommandHandler(["start", "start_admin", "stats", "mailing", "broadcast"], bot.handle_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
     application.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown))
     
     # Error handler
     application.add_error_handler(error_handler)
+
+    # Set bot commands
+    asyncio.get_event_loop().run_until_complete(
+        bot.set_bot_commands(application)
+    )
 
     # Start the bot
     logger.info("Bot started successfully!")

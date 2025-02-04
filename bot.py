@@ -343,15 +343,15 @@ class SUIBot:
             now = datetime.now()
             last_claim = datetime.fromisoformat(user_data["last_claim"])
             
-            if now - last_claim < timedelta(hours=8):
-                time_left = timedelta(hours=8) - (now - last_claim)
-                hours = int(time_left.total_seconds() // 3600)
-                minutes = int((time_left.total_seconds() % 3600) // 60)
+            if now - last_claim < timedelta(minutes=5):  # Cambiado a 5 minutos
+                time_left = timedelta(minutes=5) - (now - last_claim)
+                minutes = int(time_left.total_seconds() // 60)
+                seconds = int(time_left.total_seconds() % 60)
                 
                 await update.message.reply_text(
                     f"⏳ Next Bonus Available In:\n"
                     f"──────────────────\n"
-                    f"⌚ {hours}h {minutes}m\n"
+                    f"⌚ {minutes}m {seconds}s\n"
                     f"──────────────────\n"
                     f"💡 Come back later!"
                 )
@@ -377,7 +377,7 @@ class SUIBot:
                 f"💰 Earned: {REWARDS['claim']} SUI\n"
                 f"💎 Balance: {new_balance:.2f} SUI\n"
                 f"──────────────────\n"
-                f"⏱ Next bonus in 8 hours"
+                f"⏱ Next bonus in 5 minutes"
             )
             
         except Exception as e:
@@ -593,53 +593,92 @@ class SUIBot:
             return
 
         message = ' '.join(context.args)
+        
+        # Notify admin that mailing started
+        status_message = await update.message.reply_text(
+            "📤 Starting mailing...\n"
+            "Bot will continue working normally."
+        )
+        
+        # Start mailing in background
+        asyncio.create_task(self._execute_mailing(message, status_message, context))
+        
+    async def _execute_mailing(self, message: str, status_message: Message, context: ContextTypes.DEFAULT_TYPE):
+        """Execute mailing in background"""
         success = 0
         failed = 0
-
+        BATCH_SIZE = 100  # Process users in batches
+        
         try:
             conn = self.db_pool.get_connection()
             with conn.cursor() as cur:
-                cur.execute("SELECT user_id FROM users")
-                rows = cur.fetchall()
+                # Get total users count
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
                 
-                for row in rows:
+                # Process users in batches
+                for offset in range(0, total_users, BATCH_SIZE):
                     try:
-                        user_id = row[0]
-                        # Update timestamps
-                        with conn.cursor() as update_cur:
-                            update_cur.execute("""
-                                UPDATE users 
-                                SET last_claim = CURRENT_TIMESTAMP,
-                                    last_daily = CURRENT_TIMESTAMP
-                                WHERE user_id = %s
-                            """, (user_id,))
+                        # Get batch of users
+                        cur.execute("""
+                            SELECT user_id FROM users 
+                            LIMIT %s OFFSET %s
+                        """, (BATCH_SIZE, offset))
+                        
+                        batch_users = cur.fetchall()
+                        
+                        for row in batch_users:
+                            try:
+                                user_id = row[0]
+                                await context.bot.send_message(
+                                    chat_id=user_id,
+                                    text=f"📢 Announcement:\n\n{message}"
+                                )
+                                success += 1
+                            except Exception as e:
+                                logger.error(f"Failed to send to {user_id}: {e}")
+                                failed += 1
+                            
+                            # Update status every 50 users
+                            if (success + failed) % 50 == 0:
+                                try:
+                                    await status_message.edit_text(
+                                        f"📤 Mailing in progress...\n"
+                                        f"──────────────────\n"
+                                        f"✅ Sent: {success}\n"
+                                        f"❌ Failed: {failed}\n"
+                                        f"📊 Progress: {((success + failed) / total_users) * 100:.1f}%"
+                                    )
+                                except Exception:
+                                    pass
+                            
+                            # Small delay to avoid rate limits
+                            await asyncio.sleep(0.05)
+                        
+                        # Commit after each batch
                         conn.commit()
                         
-                        # Send message
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=f"📢 Announcement:\n\n{message}"
-                        )
-                        success += 1
                     except Exception as e:
-                        logger.error(f"Failed to send to {user_id}: {e}")
-                        failed += 1
-                    
-                    # Add small delay to avoid rate limits
-                    await asyncio.sleep(0.05)
+                        logger.error(f"Error processing batch: {e}")
+                        continue
+                
         except Exception as e:
             logger.error(f"Error in mailing: {e}")
-            await update.message.reply_text("❌ Error sending messages")
-            return
         finally:
             if conn:
                 self.db_pool.put_connection(conn)
-
-        await update.message.reply_text(
-            f"✅ Mailing completed:\n"
-            f"Success: {success}\n"
-            f"Failed: {failed}"
-        )
+            
+            # Final status update
+            try:
+                await status_message.edit_text(
+                    f"📤 Mailing completed!\n"
+                    f"──────────────────\n"
+                    f"✅ Successfully sent: {success}\n"
+                    f"❌ Failed: {failed}\n"
+                    f"📊 Total processed: {success + failed}"
+                )
+            except Exception:
+                pass
 
     async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Admin command to get bot statistics"""
@@ -747,7 +786,7 @@ class SUIBot:
                     cur.execute("""
                         SELECT user_id, last_claim, last_daily 
                         FROM users 
-                        WHERE last_claim < NOW() - INTERVAL '8 hours'
+                        WHERE last_claim < NOW() - INTERVAL '5 minutes'
                         OR last_daily < NOW() - INTERVAL '24 hours'
                         LIMIT %s
                     """, (BATCH_SIZE,))
@@ -766,7 +805,7 @@ class SUIBot:
                                     text="📅 Your daily bonus is ready!\nCome back to claim it!"
                                 )
                             
-                            if datetime.now() - last_claim > timedelta(hours=8):
+                            if datetime.now() - last_claim > timedelta(minutes=5):  # Cambiado a 5 minutos
                                 await self.application.bot.send_message(
                                     chat_id=user_id,
                                     text="🌟 Hey! Collect your bonus\nClaim it now!"
@@ -778,8 +817,10 @@ class SUIBot:
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
             finally:
-                # Check every hour instead of every 5 minutes
-                await asyncio.sleep(3600)
+                if conn:
+                    self.db_pool.put_connection(conn)
+                # Check every minute instead of every hour
+                await asyncio.sleep(60)  # Reducido a 1 minuto para ser más responsivo
 
     async def handle_invite(self, update: Update):
         """Handle invite command"""

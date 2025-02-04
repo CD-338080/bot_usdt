@@ -564,38 +564,74 @@ class USDTBot:
     async def handle_ranking(self, update: Update):
         """Handle the leaders command"""
         try:
-            conn = self.db_pool.get_connection()
-            with conn.cursor(cursor_factory=DictCursor) as cur:
-                cur.execute("""
-                    SELECT username, total_earned, referrals 
-                    FROM users 
-                    ORDER BY CAST(total_earned AS DECIMAL) DESC 
-                    LIMIT 10
-                """)
-                rows = cur.fetchall()
+            async with self.db_pool.connection() as conn:
+                with conn.cursor(cursor_factory=DictCursor) as cur:
+                    # Consulta mejorada para obtener los top 10
+                    cur.execute("""
+                        SELECT 
+                            username,
+                            balance,
+                            total_earned,
+                            referrals 
+                        FROM users 
+                        WHERE CAST(total_earned AS DECIMAL) > 0
+                        ORDER BY CAST(total_earned AS DECIMAL) DESC 
+                        LIMIT 10
+                    """)
+                    rows = cur.fetchall()
 
-                if not rows:
-                    await update.message.reply_text("No leaders yet!")
-                    return
+                    if not rows:
+                        await update.message.reply_text(
+                            "📊 Leaderboard Status\n"
+                            "──────────────────\n"
+                            "No leaders yet!\n"
+                            "──────────────────\n"
+                            "💡 Be the first one!\n"
+                            "• Use COLLECT every 5min\n"
+                            "• Get Daily Bonus\n"
+                            "• Invite friends"
+                        )
+                        return
 
-                message = "📈 Top 10 Leaders:\n\n"
-                for i, row in enumerate(rows, 1):
-                    username = row['username'] or "Anonymous"
-                    total_earned = Decimal(row['total_earned'])
-                    referrals = row['referrals']
-                    
-                    message += (
-                        f"{i}. @{username}\n"
-                        f"💰 Earned: {total_earned:.2f} USDT\n"
-                        f"🤝 Community: {referrals}\n\n"
+                    message = (
+                        "🏆 Top 10 Leaders\n"
+                        "──────────────────\n"
                     )
 
-                await update.message.reply_text(message)
+                    for i, row in enumerate(rows, 1):
+                        username = row['username'] or "Anonymous"
+                        total_earned = Decimal(row['total_earned'])
+                        balance = Decimal(row['balance'])
+                        referrals = row['referrals']
+                        
+                        # Emojis para los primeros lugares
+                        position_emoji = "👑" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+                        
+                        message += (
+                            f"\n{position_emoji} @{username}\n"
+                            f"💰 Balance: {balance:.2f} USDT\n"
+                            f"💎 Total: {total_earned:.2f} USDT\n"
+                            f"👥 Team: {referrals} members\n"
+                            f"──────────────────"
+                        )
+
+                    message += (
+                        f"\n\n💡 Tips to reach top:\n"
+                        f"• 💸 Collect every 5min\n"
+                        f"• 🎁 Get daily bonus\n"
+                        f"• 🤝 Build your team"
+                    )
+
+                    await update.message.reply_text(message)
 
         except Exception as e:
             logger.error(f"Error in ranking handler: {e}")
             await update.message.reply_text(
-                "❌ Error loading leaderboard. Please try again later!"
+                "❌ Error loading leaderboard\n"
+                "──────────────────\n"
+                "Please try again later!\n"
+                "──────────────────\n"
+                "💡 Use other functions meanwhile"
             )
 
     async def handle_help(self, update: Update):

@@ -80,26 +80,32 @@ class DatabasePool:
             raise
 
     def _initialize_tables(self):
-        """Initialize database tables with better structure"""
-        with self.get_connection() as conn:
+        """Initialize database tables"""
+        try:
+            conn = self.pool.getconn()
             with conn.cursor() as cur:
                 cur.execute("""
                     CREATE TABLE IF NOT EXISTS users (
                         user_id TEXT PRIMARY KEY,
                         username TEXT,
-                        balance NUMERIC(20,8) DEFAULT 0,
-                        total_earned NUMERIC(20,8) DEFAULT 0,
+                        balance TEXT DEFAULT '0',
+                        total_earned TEXT DEFAULT '0',
                         referrals INTEGER DEFAULT 0,
-                        last_claim TIMESTAMP DEFAULT NOW(),
-                        last_daily TIMESTAMP DEFAULT NOW(),
-                        wallet TEXT,
                         referred_by TEXT,
-                        join_date TIMESTAMP DEFAULT NOW(),
+                        last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        wallet TEXT,
                         FOREIGN KEY (referred_by) REFERENCES users(user_id)
                     )
                 """)
                 conn.commit()
                 logger.info("Database tables initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing tables: {e}")
+            raise
+        finally:
+            if conn:
+                self.pool.putconn(conn)
 
     def get_connection(self):
         """Get a database connection from the pool"""
@@ -249,93 +255,120 @@ class SUIBot:
             logger.error(f"Failed to notify referrer {referrer_id}: {e}")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Start command handler"""
+        """Handle start command and referral"""
         if not update.message:
             return
 
-        user_id = str(update.effective_user.id)
-        username = update.effective_user.username or "Anonymous"
+        user = update.effective_user
+        user_id = str(user.id)
         
         try:
+            # Verificar si el usuario ya existe
             user_data = await self.get_user(user_id)
             
+            # Si es un usuario nuevo
             if not user_data:
-                # Initialize new user data
+                # Crear datos básicos del usuario
                 user_data = {
                     "user_id": user_id,
-                    "username": username,
+                    "username": user.username or "Anonymous",
                     "balance": "0",
                     "total_earned": "0",
                     "referrals": 0,
-                    "last_claim": (datetime.now() - timedelta(hours=2)).isoformat(),
-                    "last_daily": (datetime.now() - timedelta(days=2)).isoformat(),
-                    "wallet": None,
                     "referred_by": None,
-                    "join_date": datetime.now().isoformat()
+                    "last_claim": datetime.now(UTC).isoformat(),
+                    "last_daily": datetime.now(UTC).isoformat(),
+                    "wallet": None
                 }
-
-                # Process referral
-                if context.args and len(context.args) > 0:
+                
+                # Procesar referido si existe
+                if context.args and context.args[0] != user_id:
                     referrer_id = context.args[0]
+                    referrer_data = await self.get_user(referrer_id)
                     
-                    if referrer_id != user_id:  # Prevent self-referral
-                        referrer_data = await self.get_user(referrer_id)
+                    if referrer_data:
+                        # Actualizar datos del usuario nuevo
+                        user_data["referred_by"] = referrer_id
                         
-                        if referrer_data:
-                            # Update new user with referral bonus
-                            user_data["balance"] = str(REWARDS["referral"])
-                            user_data["total_earned"] = str(REWARDS["referral"])
-                            user_data["referred_by"] = referrer_id
+                        # Actualizar datos del referidor
+                        referrer_data["referrals"] = referrer_data.get("referrals", 0) + 1
+                        new_balance = Decimal(referrer_data["balance"]) + REWARDS["referral"]
+                        new_total = Decimal(referrer_data["total_earned"]) + REWARDS["referral"]
+                        referrer_data.update({
+                            "balance": str(new_balance),
+                            "total_earned": str(new_total)
+                        })
+                        
+                        # Guardar datos del referidor
+                        await self.save_user(referrer_data)
+                        
+                        # Dar bonus al nuevo usuario
+                        user_data["balance"] = str(REWARDS["referral"])
+                        user_data["total_earned"] = str(REWARDS["referral"])
+                        
+                        # Notificar al referidor
+                        try:
+                            await context.bot.send_message(
+                                chat_id=referrer_id,
+                                text=(
+                                    f"🎉 New Referral Bonus!\n"
+                                    f"──────────────────\n"
+                                    f"👤 User: @{user.username or 'Anonymous'}\n"
+                                    f"💰 Earned: +{REWARDS['referral']} SUI\n"
+                                    f"📊 Total Referrals: {referrer_data['referrals']}"
+                                )
+                            )
+                        except Exception as e:
+                            logger.error(f"Failed to notify referrer: {e}")
 
-                            # Save new user first
-                            await self.save_user(user_data)
+                # Guardar nuevo usuario
+                await self.save_user(user_data)
+                
+                # Mensaje de bienvenida para nuevo usuario
+                welcome_message = (
+                    f"🎉 Welcome to SUI Rewards Bot!\n"
+                    f"──────────────────\n"
+                    f"💰 Start earning SUI by:\n"
+                    f"• 🕒 Collecting bonuses\n"
+                    f"• 📅 Daily rewards\n"
+                    f"• 👥 Inviting friends\n"
+                    f"──────────────────\n"
+                )
+                
+                if user_data["referred_by"]:
+                    welcome_message += (
+                        f"✨ Referral Bonus: +{REWARDS['referral']} SUI\n"
+                        f"Thanks for using a referral link!"
+                    )
+            else:
+                welcome_message = (
+                    f"👋 Welcome back!\n"
+                    f"──────────────────\n"
+                    f"💎 Balance: {user_data['balance']} SUI\n"
+                    f"👥 Referrals: {user_data['referrals']}\n"
+                    f"──────────────────"
+                )
 
-                            try:
-                                # Update referrer's data
-                                referrer_data["balance"] = str(Decimal(referrer_data["balance"]) + REWARDS["referral"])
-                                referrer_data["total_earned"] = str(Decimal(referrer_data["total_earned"]) + REWARDS["referral"])
-                                referrer_data["referrals"] = referrer_data["referrals"] + 1
-
-                                # Save referrer's updated data
-                                await self.save_user(referrer_data)
-
-                                # Notify referrer
-                                await self._notify_referrer(context.bot, referrer_id)
-                                
-                            except Exception as e:
-                                logger.error(f"Error updating referrer: {e}")
-                else:
-                    # Save new user without referral
-                    await self.save_user(user_data)
-
-            # Send welcome message
-            welcome_msg = self._get_welcome_message(user_data)
-            await update.message.reply_text(welcome_msg, reply_markup=self._keyboard)
+            # Crear teclado
+            keyboard = [
+                ["🌟 Collect", "📅 Daily Reward"],
+                ["📊 My Stats", "👨‍👦‍👦 Invite"],
+                ["💸 Cash Out", "🔑 SUI Address"],
+                ["🏆 Leaders", "❓ Info"]
+            ]
+            reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+            
+            # Enviar mensaje con teclado
+            await update.message.reply_text(
+                welcome_message,
+                reply_markup=reply_markup
+            )
 
         except Exception as e:
-            logger.error(f"Critical error in start handler: {str(e)}")
-            await update.message.reply_text("⚠️ Something went wrong. Please try again later.")
-
-    def _get_welcome_message(self, user_data):
-        """Separate method for welcome message to improve readability"""
-        if user_data.get("referred_by"):
-            return (
-                f"🌟 Welcome to SUI Capital Bot〽️\n\n"
-                f"💎 Congratulations! You've received {REWARDS['referral']} SUI as a referral bonus!\n\n"
-                "💰 Earning Methods:\n"
-                "• ⚡ Hourly Claims\n"
-                "• 📅 Daily Rewards\n"
-                "• 👥 Referral Program\n\n"
-                "🔥 Start earning now with our reward system!"
+            logger.error(f"Error in start handler: {e}")
+            await update.message.reply_text(
+                "❌ An error occurred. Please try again!"
             )
-        return (
-            "🌟 Welcome to SUI Capital Bot〽️\n\n"
-            "💰 Start Earning SUI:\n"
-            "• ⚡ Hourly Claims\n"
-            "• 📅 Daily Rewards\n"
-            "• 👥 Referral Program\n\n"
-            "🔥 Join our community and start earning today!"
-        )
 
     async def handle_claim(self, update: Update, user_data: dict):
         """Improved claim handler with better error handling"""
@@ -502,7 +535,7 @@ class SUIBot:
         await update.message.reply_text(
             f"✅ Withdrawal Request\n"
             f"──────────────────\n"
-            f"💎 Amount: {balance:.2f} SUI\n"
+            f" Amount: {balance:.2f} SUI\n"
             f"🏦 Wallet: {user_data['wallet']}\n"
             f"🌐 Network: SUI Network\n"
             f"──────────────────\n"

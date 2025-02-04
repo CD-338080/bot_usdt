@@ -596,18 +596,26 @@ class SUIBot:
         success = 0
         failed = 0
 
-        async with self.db_pool.connection() as conn:
-            async with conn.cursor() as cur:
-                await cur.execute("SELECT user_id FROM users")
-                async for (user_id,) in cur:
+        try:
+            conn = self.db_pool.get_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT user_id FROM users")
+                rows = cur.fetchall()
+                
+                for row in rows:
                     try:
-                        async with conn.cursor() as cur:
-                            await cur.execute("""
+                        user_id = row[0]
+                        # Update timestamps
+                        with conn.cursor() as update_cur:
+                            update_cur.execute("""
                                 UPDATE users 
                                 SET last_claim = CURRENT_TIMESTAMP,
                                     last_daily = CURRENT_TIMESTAMP
                                 WHERE user_id = %s
                             """, (user_id,))
+                        conn.commit()
+                        
+                        # Send message
                         await context.bot.send_message(
                             chat_id=user_id,
                             text=f"📢 Announcement:\n\n{message}"
@@ -619,7 +627,14 @@ class SUIBot:
                     
                     # Add small delay to avoid rate limits
                     await asyncio.sleep(0.05)
-        
+        except Exception as e:
+            logger.error(f"Error in mailing: {e}")
+            await update.message.reply_text("❌ Error sending messages")
+            return
+        finally:
+            if conn:
+                self.db_pool.put_connection(conn)
+
         await update.message.reply_text(
             f"✅ Mailing completed:\n"
             f"Success: {success}\n"
@@ -628,37 +643,50 @@ class SUIBot:
 
     async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Admin command to get bot statistics"""
-        if str(update.effective_user.id) != ADMIN_ID:
+        if str(update.effective_user.id) != self.admin_id:
             return
 
         try:
-            async with self.db_pool.connection() as conn:
+            conn = self.db_pool.get_connection()
+            with conn.cursor() as cur:
                 # Get total users
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT COUNT(*) FROM users")
-                    total_users = (await cur.fetchone())[0]
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
 
                 # Get active users (last 24h)
-                day_ago = (datetime.now() - timedelta(days=1)).isoformat()
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT COUNT(*) FROM users WHERE last_claim > %s", (day_ago,))
-                    active_users = (await cur.fetchone())[0]
+                cur.execute("""
+                    SELECT COUNT(*) FROM users 
+                    WHERE last_claim > NOW() - INTERVAL '24 hours'
+                    OR last_daily > NOW() - INTERVAL '24 hours'
+                """)
+                active_users = cur.fetchone()[0]
 
                 # Get total earned
-                async with conn.cursor() as cur:
-                    await cur.execute("SELECT SUM(CAST(total_earned AS DECIMAL)) FROM users")
-                    total_earned = (await cur.fetchone())[0] or 0
+                cur.execute("SELECT SUM(CAST(total_earned AS DECIMAL)) FROM users")
+                total_earned = cur.fetchone()[0] or 0
+
+                # Get total referrals
+                cur.execute("SELECT SUM(referrals) FROM users")
+                total_referrals = cur.fetchone()[0] or 0
 
             await update.message.reply_text(
-                "📊 Bot Statistics:\n\n"
-                f"👨‍👦‍👦 Total Users: {total_users:,}\n"
+                f"📊 Bot Statistics\n"
+                f"──────────────────\n"
+                f"👥 Total Users: {total_users:,}\n"
                 f"✨ Active Users (24h): {active_users:,}\n"
-                f"📊 Total SUI Earned: {total_earned:,.2f}\n"
-                f"💾 Cached Users: {len(self.user_cache):,}"
+                f"💰 Total SUI Earned: {total_earned:,.2f}\n"
+                f"👥 Total Referrals: {total_referrals:,}\n"
+                f"💾 Cached Users: {len(self.user_cache):,}\n"
+                f"──────────────────\n"
+                f"🕒 Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
             )
+
         except Exception as e:
             logger.error(f"Error in stats: {e}")
             await update.message.reply_text("❌ Error getting statistics!")
+        finally:
+            if conn:
+                self.db_pool.put_connection(conn)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.message or not update.message.text:

@@ -245,6 +245,7 @@ class SUIBot:
         self.notification_task = None
         self.mailing_in_progress = False
         self.stop_mailing = False
+        self.mailing_task = None
 
     async def init_db(self):
         """Initialize database connection"""
@@ -699,48 +700,57 @@ class SUIBot:
     async def handle_mailing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle admin mailing command"""
         try:
-            message_text = update.message.text
-            args = message_text.split(maxsplit=2)[1:]  # Split into command and message
-
-            if not args:
+            # Obtener el texto completo después de /mailing
+            full_text = update.message.text
+            if ' ' not in full_text:
                 await update.message.reply_text(
                     "📬 Mailing Usage:\n"
                     "──────────────────\n"
-                    "/mailing start <message> - Start mailing\n"
+                    "/mailing <message> - Start mailing\n"
                     "/mailing stop - Stop current mailing\n"
                     "/mailing status - Check status"
                 )
                 return
 
-            action = args[0].lower()
+            command_parts = full_text.split(' ', 1)
+            if len(command_parts) < 2:
+                await update.message.reply_text("❌ Please provide a message or command")
+                return
 
-            if action == "start":
+            action = command_parts[1].lower()
+
+            if action == "stop":
                 if self.mailing_in_progress:
-                    await update.message.reply_text("❌ Mailing already in progress")
-                    return
-
-                if len(args) < 2:
-                    await update.message.reply_text("❌ Message is required")
-                    return
-
-                message = args[1]
-                self.mailing_in_progress = True
-                self.stop_mailing = False
-                status_message = await update.message.reply_text("📬 Starting mailing...")
-                
-                # Start mailing in background
-                asyncio.create_task(self._execute_mailing(message, status_message, context))
-
-            elif action == "stop":
-                if not self.mailing_in_progress:
+                    self.stop_mailing = True
+                    await update.message.reply_text("🛑 Stopping mailing...")
+                else:
                     await update.message.reply_text("❌ No mailing in progress")
-                    return
-                self.stop_mailing = True
-                await update.message.reply_text("🛑 Stopping mailing...")
+                return
 
-            elif action == "status":
+            if action == "status":
                 status = "📬 Mailing in progress" if self.mailing_in_progress else "📭 No mailing in progress"
                 await update.message.reply_text(status)
+                return
+
+            if self.mailing_in_progress:
+                await update.message.reply_text("❌ Mailing already in progress")
+                return
+
+            # Si llegamos aquí, es un nuevo mailing
+            message = command_parts[1]
+            self.mailing_in_progress = True
+            self.stop_mailing = False
+            
+            status_message = await update.message.reply_text(
+                "📬 Starting mailing...\n"
+                "──────────────────\n"
+                "Progress will be updated every 50 messages"
+            )
+            
+            # Iniciar mailing en background
+            self.mailing_task = asyncio.create_task(
+                self._execute_mailing(message, status_message, context)
+            )
 
         except Exception as e:
             logger.error(f"Error in mailing command: {e}")
@@ -748,63 +758,87 @@ class SUIBot:
 
     async def _execute_mailing(self, message: str, status_message: Message, context: ContextTypes.DEFAULT_TYPE):
         """Execute mailing in background"""
+        conn = None
         try:
             conn = self.db_pool.get_connection()
             with conn.cursor() as cur:
+                # Obtener total de usuarios
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
+
+                # Obtener usuarios en lotes
                 cur.execute("SELECT user_id FROM users")
-                total_users = 0
+                
                 successful = 0
                 failed = 0
+                processed = 0
                 
-                for row in cur:
+                while True:
+                    rows = cur.fetchmany(100)  # Procesar en lotes de 100
+                    if not rows:
+                        break
+                    
                     if self.stop_mailing:
                         break
 
-                    user_id = row[0]
-                    total_users += 1
+                    for row in rows:
+                        user_id = row[0]
+                        processed += 1
 
-                    try:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=message,
-                            disable_web_page_preview=True
-                        )
-                        successful += 1
-                    except Exception as e:
-                        logger.error(f"Failed to send message to {user_id}: {e}")
-                        failed += 1
+                        try:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=message,
+                                disable_web_page_preview=True
+                            )
+                            successful += 1
+                        except Exception as e:
+                            logger.error(f"Failed to send message to {user_id}: {e}")
+                            failed += 1
 
-                    if total_users % 50 == 0:  # Update status every 50 users
-                        await status_message.edit_text(
-                            f"📬 Mailing Progress:\n"
-                            f"──────────────────\n"
-                            f"✅ Sent: {successful:,}\n"
-                            f"❌ Failed: {failed:,}\n"
-                            f"📊 Progress: {total_users:,} users"
-                        )
-                    
-                    await asyncio.sleep(0.05)  # Prevent flooding
+                        # Actualizar estado cada 50 mensajes
+                        if processed % 50 == 0:
+                            progress = (processed / total_users) * 100
+                            try:
+                                await status_message.edit_text(
+                                    f"📬 Mailing Progress:\n"
+                                    f"──────────────────\n"
+                                    f"✅ Sent: {successful:,}\n"
+                                    f"❌ Failed: {failed:,}\n"
+                                    f"📊 Progress: {progress:.1f}%\n"
+                                    f"({processed:,}/{total_users:,} users)"
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to update status: {e}")
+
+                        await asyncio.sleep(0.05)  # Prevenir flood
 
         except Exception as e:
             logger.error(f"Error in mailing execution: {e}")
+            try:
+                await status_message.edit_text("❌ Error during mailing execution")
+            except:
+                pass
         finally:
             if conn:
                 self.db_pool.put_connection(conn)
             self.mailing_in_progress = False
+            self.mailing_task = None
             
-            # Final status update
             try:
+                # Actualización final del estado
+                status = "completed" if not self.stop_mailing else "stopped"
                 await status_message.edit_text(
-                    f"📬 Mailing {'Completed' if not self.stop_mailing else 'Stopped'}!\n"
+                    f"📬 Mailing {status}!\n"
                     f"──────────────────\n"
                     f"✅ Successful: {successful:,}\n"
                     f"❌ Failed: {failed:,}\n"
-                    f"👥 Total Users: {total_users:,}\n"
+                    f"👥 Total Processed: {processed:,}\n"
                     f"──────────────────\n"
                     f"📅 {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
                 )
             except Exception as e:
-                logger.error(f"Error updating final status: {e}")
+                logger.error(f"Failed to update final status: {e}")
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all messages"""

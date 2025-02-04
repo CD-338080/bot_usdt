@@ -779,6 +779,9 @@ class SUIBot:
     async def start_notification_task(self):
         """Background task to check and send notifications"""
         BATCH_SIZE = 1000
+        # Cache para rastrear las últimas notificaciones enviadas
+        notification_cache = {}
+        
         while True:
             try:
                 conn = self.db_pool.get_connection()
@@ -794,16 +797,14 @@ class SUIBot:
                     """, (BATCH_SIZE,))
                     rows = cur.fetchall()
                     
+                    now = datetime.now(UTC).replace(tzinfo=None)
+                    
                     for row in rows:
                         try:
                             user_id = row['user_id']
                             last_claim = row['last_claim']
                             last_daily = row['last_daily']
                             
-                            # Usar datetime.now(UTC) en lugar de utcnow()
-                            now = datetime.now(UTC).replace(tzinfo=None)
-                            
-                            # Convertir last_claim y last_daily a UTC naive
                             if isinstance(last_claim, datetime):
                                 last_claim = last_claim.replace(tzinfo=None)
                             else:
@@ -814,17 +815,28 @@ class SUIBot:
                             else:
                                 continue
 
+                            # Verificar daily bonus
                             if now - last_daily > timedelta(days=1):
-                                await self.application.bot.send_message(
-                                    chat_id=user_id,
-                                    text="📅 Your daily bonus is ready!\nCome back to claim it!"
-                                )
+                                cache_key = f"{user_id}_daily"
+                                if cache_key not in notification_cache or \
+                                   now - notification_cache[cache_key] > timedelta(hours=23):
+                                    await self.application.bot.send_message(
+                                        chat_id=user_id,
+                                        text="📅 Your daily bonus is ready!\nCome back to claim it!"
+                                    )
+                                    notification_cache[cache_key] = now
                             
+                            # Verificar claim bonus
                             if now - last_claim > timedelta(minutes=5):
-                                await self.application.bot.send_message(
-                                    chat_id=user_id,
-                                    text="🌟 Hey! Collect your bonus\nClaim it now!"
-                                )
+                                cache_key = f"{user_id}_claim"
+                                if cache_key not in notification_cache or \
+                                   now - notification_cache[cache_key] > timedelta(minutes=4):
+                                    await self.application.bot.send_message(
+                                        chat_id=user_id,
+                                        text="🌟 Hey! Collect your bonus\nClaim it now!"
+                                    )
+                                    notification_cache[cache_key] = now
+                                
                         except Exception as e:
                             logger.error(f"Error processing notification for {user_id}: {e}")
                         await asyncio.sleep(0.05)
@@ -835,6 +847,11 @@ class SUIBot:
                 if conn:
                     self.db_pool.put_connection(conn)
                 await asyncio.sleep(60)
+                
+                # Limpiar cache antigua
+                current_time = datetime.now(UTC).replace(tzinfo=None)
+                notification_cache = {k: v for k, v in notification_cache.items() 
+                                   if current_time - v < timedelta(days=1)}
 
     async def handle_invite(self, update: Update):
         """Handle invite command"""

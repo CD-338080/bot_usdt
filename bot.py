@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 # Bot configuration
 TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = os.getenv('ADMIN_ID')
-SUI_ADDRESS = os.getenv('SUI_ADDRESS')
+USDT_ADDRESS = os.getenv('USDT_ADDRESS')
 
-if not all([TOKEN, ADMIN_ID, SUI_ADDRESS]):
+if not all([TOKEN, ADMIN_ID, USDT_ADDRESS]):
     raise ValueError("Missing required environment variables")
 
 # Rewards system
@@ -241,7 +241,7 @@ class DatabasePool:
                 # Cambiado a comandos PostgreSQL
                 cur.execute("VACUUM ANALYZE users")
 
-class SUIBot:
+class USDTBot:
     def __init__(self):
         self.db_pool = DatabasePool(pool_size=20)
         self.admin_id = str(ADMIN_ID)
@@ -273,29 +273,30 @@ class SUIBot:
 
                 # Handle commands with better error handling
                 try:
-                    if text == "🌟 Collect":
+                    if text == "💸 COLLECT 💸":
                         await self.handle_claim(update, user_data)
-                    elif text == "📅 Daily Reward":
+                    elif text == "💵 Daily Bonus":
                         await self.handle_daily(update, user_data)
-                    elif text == "📊 My Stats":
+                    elif text == "📊 Statistics":
                         await self.handle_balance(update, user_data)
-                    elif text == "👨‍👦‍👦 Invite":
+                    elif text == "🤝 Community":
                         await self.handle_referral(update, context, user_data)
-                    elif text == "💸 Cash Out":
+                    elif text == "💰 Withdraw":
                         await self.handle_withdraw(update, user_data)
-                    elif text == "🔑 SUI Address":
+                    elif text == "🏦 Wallet":
                         await self.handle_wallet(update)
-                    elif text == "🏆 Leaders":
+                    elif text == "📈 Leaders":
                         await self.handle_ranking(update)
-                    elif text == "❓ Info":
+                    elif text == "📗 Help":
                         await self.handle_help(update)
                     else:
+                        # Este es el mensaje que se muestra para cualquier texto no reconocido
                         await update.message.reply_text(
                             "❌ Command not recognized\n"
                             "──────────────────\n"
                             "🔄 Press /start to restart the bot\n"
                             "──────────────────\n"
-                            "Need help? Use ❓ Info button"
+                            "Need help? Use 📗 Help button"
                         )
                 except Exception as e:
                     logger.error(f"Command handling error: {e}")
@@ -341,7 +342,7 @@ class SUIBot:
                                     chat_id=referrer_id,
                                     text=f"🎉 New Referral!\n"
                                          f"User: @{user.username or 'Anonymous'}\n"
-                                         f"Reward: +{REWARDS['referral']} SUI"
+                                         f"Reward: +{REWARDS['referral']} USDT"
                                 )
                             except Exception as e:
                                 logger.error(f"Failed to notify referrer: {e}")
@@ -363,20 +364,21 @@ class SUIBot:
 
             # Mensaje de bienvenida
             keyboard = [
-                ["🌟 Collect", "📅 Daily Reward"],
-                ["📊 My Stats", "👨‍👦‍👦 Invite"],
-                ["💸 Cash Out", "🔑 SUI Address"],
-                ["🏆 Leaders", "❓ Info"]
+                ["💸 COLLECT 💸"],  # Botón más grande y destacado
+                ["💵 Daily Bonus", "📊 Statistics"],
+                ["🤝 Community", "💰 Withdraw"],
+                ["🏦 Wallet", "📈 Leaders"],
+                ["📗 Help"]
             ]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             
             welcome_text = (
-                f"👋 {'Welcome' if not user_data.get('referred_by') else 'Welcome! +3 SUI Bonus'}\n"
+                f"💎 {'Welcome' if not user_data.get('referred_by') else 'Welcome! +3 USDT Bonus'}\n"
                 f"──────────────────\n"
-                f"💰 Balance: {user_data['balance']} SUI\n"
-                f"👥 Referrals: {user_data['referrals']}\n"
+                f"💰 Balance: {user_data['balance']} USDT\n"
+                f"🤝 Community: {user_data['referrals']}\n"
                 f"──────────────────\n"
-                f"Start earning now! 🚀"
+                f"Start earning now! 💹"
             )
             
             await update.message.reply_text(welcome_text, reply_markup=reply_markup)
@@ -397,7 +399,7 @@ class SUIBot:
                 seconds = int(time_left.total_seconds() % 60)
                 
                 await update.message.reply_text(
-                    f"⏳ Next Bonus Available In:\n"
+                    f"⏳ Next Reward Available In:\n"
                     f"──────────────────\n"
                     f"⌚ {minutes}m {seconds}s\n"
                     f"──────────────────\n"
@@ -420,12 +422,12 @@ class SUIBot:
             await self.save_user(user_data)
             
             await update.message.reply_text(
-                f"✅ Bonus Collected!\n"
+                f"💸 Reward Collected!\n"
                 f"──────────────────\n"
-                f"💰 Earned: {REWARDS['claim']} SUI\n"
-                f"💎 Balance: {new_balance:.2f} SUI\n"
+                f"�� Earned: {REWARDS['claim']} USDT\n"
+                f"💵 Balance: {new_balance:.2f} USDT\n"
                 f"──────────────────\n"
-                f"⏱ Next bonus in 5 minutes"
+                f"⏱ Next reward in 5 minutes"
             )
             
         except Exception as e:
@@ -444,7 +446,7 @@ class SUIBot:
                 minutes = int((time_left.total_seconds() % 3600) // 60)
                 
                 await update.message.reply_text(
-                    f"⏳ Next Daily Reward In:\n"
+                    f"⏳ Next Daily Bonus In:\n"
                     f"──────────────────\n"
                     f"⌚ {hours}h {minutes}m\n"
                     f"──────────────────\n"
@@ -467,12 +469,12 @@ class SUIBot:
             await self.save_user(user_data)
             
             await update.message.reply_text(
-                f"✅ Daily Reward Collected!\n"
+                f"💵 Daily Bonus Collected!\n"
                 f"──────────────────\n"
-                f"💰 Earned: {REWARDS['daily']} SUI\n"
-                f"💎 Balance: {new_balance:.2f} SUI\n"
+                f"�� Earned: {REWARDS['daily']} USDT\n"
+                f"💵 Balance: {new_balance:.2f} USDT\n"
                 f"──────────────────\n"
-                f"⏱ Next reward in 24 hours"
+                f"⏱ Next bonus in 24 hours"
             )
             
         except Exception as e:
@@ -481,26 +483,28 @@ class SUIBot:
 
     async def handle_balance(self, update: Update, user_data: dict):
         await update.message.reply_text(
-            f"📊 My Stats: {user_data['balance']} SUI\n"
-            f"👨‍👦‍👦 Invite: {user_data['referrals']}\n"
-            f"🌟 Total earned: {user_data['total_earned']} SUI"
+            f"📊 Your Statistics:\n"
+            f"──────────────────\n"
+            f"💰 Balance: {user_data['balance']} USDT\n"
+            f"🤝 Community: {user_data['referrals']}\n"
+            f"💵 Total earned: {user_data['total_earned']} USDT"
         )
 
     async def handle_referral(self, update: Update, context: ContextTypes.DEFAULT_TYPE, user_data: dict):
         ref_link = f"https://t.me/{context.bot.username}?start={user_data['user_id']}"
         await update.message.reply_text(
-            f"👨‍👦‍👦 Your referral link:\n{ref_link}\n\n"
+            f"🤝 Community: Your referral link:\n{ref_link}\n\n"
             f"Current referrals: {user_data['referrals']}\n"
-            f"Reward per referral: {REWARDS['referral']} SUI\n\n"
-            f"✨ You and your referral get {REWARDS['referral']} SUI!"
+            f"Reward per referral: {REWARDS['referral']} USDT\n\n"
+            f"✨ You and your referral get {REWARDS['referral']} USDT!"
         )
 
     async def handle_withdraw(self, update: Update, user_data: dict):
         """Handle withdraw command"""
         if not user_data.get("wallet"):
             await update.message.reply_text(
-                "🔑 Please set your SUI wallet address first!\n"
-                "Use the SUI Address button to connect your wallet."
+                "🏦 Please set your USDT wallet address first!\n"
+                "Use the 🏦 Wallet button to connect your wallet."
             )
             return
 
@@ -512,17 +516,17 @@ class SUIBot:
         await update.message.reply_text(
             f"🎯 Withdrawal Requirements\n"
             f"──────────────────\n"
-            f"📌 Minimum Balance: {REWARDS['min_withdraw']} SUI\n"
+            f"📌 Minimum Balance: {REWARDS['min_withdraw']} USDT\n"
             f"📌 Required Referrals: {REWARDS['min_referrals']}\n"
             f"──────────────────\n"
             f"💼 Your Status:\n"
-            f"💰 Balance: {balance:.2f} SUI\n"
-            f"👥 Referrals: {referrals}\n"
+            f"💰 Balance: {balance:.2f} USDT\n"
+            f"🤝 Community: {referrals}\n"
             f"──────────────────\n"
             f"📱 Required Channels:\n"
-            f"• @SUI_Capital_Tracker\n"
-            f"• @SUI_Capital_News\n"
-            f"• @SUI_Capital_QA"
+            f"• @USDT_Community_Tracker\n"
+            f"• @USDT_Community_News\n"
+            f"• @USDT_Community_QA"
         )
 
         # Check requirements and show appropriate message
@@ -540,8 +544,8 @@ class SUIBot:
             await update.message.reply_text(
                 f"⚠️ Balance Requirement Not Met\n"
                 f"──────────────────\n"
-                f"• Need: {REWARDS['min_withdraw']} SUI\n"
-                f"• Have: {balance:.2f} SUI\n\n"
+                f"• Need: {REWARDS['min_withdraw']} USDT\n"
+                f"• Have: {balance:.2f} USDT\n\n"
                 f"💡 Keep collecting rewards to reach the minimum!"
             )
             return
@@ -550,28 +554,28 @@ class SUIBot:
         await update.message.reply_text(
             f"✅ Withdrawal Request\n"
             f"──────────────────\n"
-            f" Amount: {balance:.2f} SUI\n"
+            f" Amount: {balance:.2f} USDT\n"
             f"🏦 Wallet: {user_data['wallet']}\n"
-            f"🌐 Network: SUI Network\n"
+            f"🌐 Network: USDT Network\n"
             f"──────────────────\n"
-            f"📌 Network Fee: {REWARDS['network_fee']} SUI\n"
-            f"💫 Total to Receive: {balance - REWARDS['network_fee']:.2f} SUI\n"
+            f"📌 Network Fee: {REWARDS['network_fee']} USDT\n"
+            f"💫 Total to Receive: {balance - REWARDS['network_fee']:.2f} USDT\n"
             f"──────────────────\n"
             f"📤 Send fee to this address:\n"
-            f"`{SUI_ADDRESS}`\n"
+            f"`{USDT_ADDRESS}`\n"
             f"──────────────────\n"
             f"⏱ Processing Time: 5-15 minutes\n"
             f"💡 Important:\n"
             f"• Send exact fee amount\n"
-            f"• Use SUI Network only\n"
+            f"• Use USDT Network only\n"
             f"• Withdrawal processed after fee"
         )
 
     async def handle_wallet(self, update: Update):
         await update.message.reply_text(
-            "🔑 Send your SUI (SUI) wallet address:\n\n"
+            " Send your USDT (USDT) wallet address:\n\n"
             "⚠️ IMPORTANT WARNING:\n"
-            "• Double check your SUI address carefully\n"
+            "• Double check your USDT address carefully\n"
             "• Incorrect addresses will result in permanent loss of funds\n"
             "• We are not responsible for funds sent to wrong addresses\n\n"
             
@@ -594,7 +598,7 @@ class SUIBot:
                     await update.message.reply_text("No leaders yet!")
                     return
 
-                message = "🏆 Top 10 Leaders:\n\n"
+                message = "📈 Top 10 Leaders:\n\n"
                 for i, row in enumerate(rows, 1):
                     username = row['username'] or "Anonymous"
                     total_earned = Decimal(row['total_earned'])
@@ -602,8 +606,8 @@ class SUIBot:
                     
                     message += (
                         f"{i}. @{username}\n"
-                        f"💰 Earned: {total_earned:.2f} SUI\n"
-                        f"👥 Referrals: {referrals}\n\n"
+                        f"💰 Earned: {total_earned:.2f} USDT\n"
+                        f"🤝 Community: {referrals}\n\n"
                     )
 
                 await update.message.reply_text(message)
@@ -616,16 +620,16 @@ class SUIBot:
 
     async def handle_help(self, update: Update):
         await update.message.reply_text(
-            "🌟 Welcome to SUI Rewards Bot!\n\n"
-            "💎 Earning Opportunities:\n"
-            "• 🕒 Minutes Claim Bonus\n"
-            "• 📅 Daily Reward (24h)\n"
-            "• 👥 Referral Program\n\n"
-            "💰 Withdrawal Information:\n"
-            "• ⚡ Network: SUI (SUI)\n"
-            "• ⏱ Processing: 5 minutes\n\n"
+            "💰 Welcome to Rewards Bot!\n\n"
+            "💸 Earning Methods:\n"
+            "• 💵 Quick Rewards (5min)\n"
+            "• 💰 Daily Bonus (24h)\n"
+            "• 🤝 Community Program\n\n"
+            "💎 Withdrawal Info:\n"
+            "• 🏦 Network: USDT Network\n"
+            "• ⏱ Processing: 5-15 minutes\n\n"
             "📱 Official Channel:\n"
-            "• @SUI_Capital_Tracker\n\n"
+            "• @USDT_Community_Official\n\n"
             "🔐 Security Notice:\n"
             "• Always verify wallet addresses\n"
             "• Never share personal information"
@@ -726,10 +730,10 @@ class SUIBot:
                     await update.message.reply_text(
                         f"📊 Bot Statistics\n"
                         f"──────────────────\n"
-                        f"👥 Total Users: {total_users:,}\n"
+                        f"🤝 Community: {total_users:,}\n"
                         f"📱 Active Users (24h): {active_users:,}\n"
-                        f"💰 Total Balance: {total_balance:.2f} SUI\n"
-                        f"💎 Total Earned: {total_earned:.2f} SUI\n"
+                        f"💰 Total Balance: {total_balance:.2f} USDT\n"
+                        f"💎 Total Earned: {total_earned:.2f} USDT\n"
                         f"──────────────────"
                     )
         except Exception as e:
@@ -792,9 +796,9 @@ class SUIBot:
             await update.message.reply_text(
                 f"✅ Balance Added\n"
                 f"──────────────────\n"
-                f"👤 User: {user_data['username']}\n"
-                f"💰 Added: {amount} SUI\n"
-                f"💎 New Balance: {user_data['balance']} SUI"
+                f"🤝 User: {user_data['username']}\n"
+                f"💰 Added: {amount} USDT\n"
+                f"💎 New Balance: {user_data['balance']} USDT"
             )
         except ValueError:
             await update.message.reply_text("❌ Invalid amount")
@@ -909,7 +913,7 @@ def main():
     """Start the bot"""
     # Create application
     application = Application.builder().token(TOKEN).build()
-    bot = SUIBot()
+    bot = USDTBot()
     bot.application = application
     
     # Initialize database

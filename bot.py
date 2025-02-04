@@ -13,6 +13,7 @@ import os
 import sys
 import psycopg2
 from psycopg2.extras import DictCursor
+from psycopg2.pool import SimpleConnectionPool
 from urllib.parse import urlparse
 from signal import signal, SIGINT, SIGTERM, SIGABRT
 import time
@@ -60,7 +61,7 @@ class DatabasePool:
                 raise ValueError("DATABASE_URL environment variable is required")
 
             url = urlparse(DATABASE_URL)
-            self.pool = psycopg2.pool.SimpleConnectionPool(
+            self.pool = SimpleConnectionPool(
                 1, self.pool_size,
                 user=url.username,
                 password=url.password,
@@ -101,23 +102,26 @@ class DatabasePool:
                 logger.info("Database tables initialized successfully")
 
     def get_connection(self):
-        """Get a database connection"""
+        """Get a database connection from the pool"""
+        if not self.pool:
+            raise Exception("Database pool not initialized")
         return self.pool.getconn()
 
-    async def close(self):
-        """Close database connection"""
-        await self.pool.close()
+    def put_connection(self, conn):
+        """Return a connection to the pool"""
+        if self.pool:
+            self.pool.putconn(conn)
 
     @asynccontextmanager
     async def connection(self):
-        """Get a database connection"""
-        conn = self.get_connection()
+        """Context manager for database connections"""
+        conn = None
         try:
-            with conn.cursor(cursor_factory=DictCursor) as cur:
-                yield cur
+            conn = self.get_connection()
+            yield conn
         finally:
             if conn:
-                conn.close()
+                self.put_connection(conn)
 
     async def save_user(self, user_data: dict):
         """Guardar datos del usuario en PostgreSQL"""

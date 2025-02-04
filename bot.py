@@ -878,6 +878,17 @@ class SUIBot:
             logger.error(f"Error in invite handler: {e}")
             await update.message.reply_text("❌ An error occurred!")
 
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again later!"
+            )
+    except Exception as e:
+        logger.error(f"Failed to send error message to admin: {e}")
+
 def main():
     """Start the bot"""
     # Create the Application
@@ -904,14 +915,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
-    try:
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ An error occurred. Please try again later!"
-            )
-        except Exception as e:
-            logger.error(f"Failed to send error message to admin: {e}")

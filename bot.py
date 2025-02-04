@@ -307,6 +307,11 @@ class USDTBot:
                     await self.start(update, context)
                     return
 
+                # Handle wallet address submission
+                if len(text) >= 30 and text.startswith('T'):  # Verificar si parece una dirección TRC20
+                    await self.save_wallet_address(update, user_data, text)
+                    return
+
                 # Handle commands with better error handling
                 try:
                     if text == "💸 COLLECT 💸":
@@ -326,7 +331,6 @@ class USDTBot:
                     elif text == "📗 Help":
                         await self.handle_help(update)
                     else:
-                        # Este es el mensaje que se muestra para cualquier texto no reconocido
                         await update.message.reply_text(
                             "❌ Command not recognized\n"
                             "──────────────────\n"
@@ -630,7 +634,7 @@ class USDTBot:
             "• Invalid addresses cannot be recovered\n"
             "• Withdrawals are processed automatically\n"
             "──────────────────\n"
-            "💡 Need help? Use /help command"
+            
         )
 
     async def handle_ranking(self, update: Update):
@@ -677,7 +681,7 @@ class USDTBot:
             "💰 Earning System:\n"
             "• ⚡ Fast Collect: 5 USDT / 5min\n"
             "• 🎁 Daily Bonus: 25 USDT / 24h\n" 
-            "• �� Referrals: 10 USDT each\n"
+            "• 🤝 Referrals: 10 USDT each\n"
             "──────────────────\n"
             "💎 Withdrawal Details:\n"
             "• 💵 Min. Amount: 100 USDT\n"
@@ -965,6 +969,41 @@ class USDTBot:
         except Exception as e:
             logger.error(f"Error saving user: {e}")
             raise
+
+    async def save_wallet_address(self, update: Update, user_data: dict, wallet_address: str):
+        """Save wallet address for user"""
+        try:
+            # Validación básica de la dirección
+            if not wallet_address.startswith('T') or len(wallet_address) < 30:
+                await update.message.reply_text(
+                    "❌ Invalid TRC20 Address\n"
+                    "──────────────────\n"
+                    "Please send a valid USDT (TRC20) address\n"
+                    "──────────────────\n"
+                    "🔄 Try again or use 📗 Help"
+                )
+                return
+
+            # Actualizar wallet en user_data
+            user_data['wallet'] = wallet_address
+            await self.save_user(user_data)
+
+            # Confirmar al usuario
+            await update.message.reply_text(
+                "✅ Wallet Connected Successfully!\n"
+                "──────────────────\n"
+                f"🏦 Address: {wallet_address}\n"
+                "──────────────────\n"
+                "💡 You can now use the withdraw function\n"
+                "🔐 Your address has been saved securely"
+            )
+        except Exception as e:
+            logger.error(f"Error saving wallet address: {e}")
+            await update.message.reply_text(
+                "❌ Error saving wallet address\n"
+                "──────────────────\n"
+                "Please try again later"
+            )
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""

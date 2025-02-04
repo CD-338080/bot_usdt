@@ -49,14 +49,15 @@ REWARDS = {
 }
 
 class DatabasePool:
-    def __init__(self, pool_size=20):
+    def __init__(self, pool_size=50):  # Aumentado el tamaño del pool
         self.pool_size = pool_size
         self.pool = None
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         self._lock = asyncio.Lock()
+        self._connection_semaphore = asyncio.Semaphore(pool_size)
 
     async def initialize(self):
-        """Initialize database pool with better error handling"""
+        """Initialize database pool with better connection management"""
         try:
             DATABASE_URL = os.getenv('DATABASE_URL')
             if not DATABASE_URL:
@@ -64,7 +65,8 @@ class DatabasePool:
 
             url = urlparse(DATABASE_URL)
             self.pool = SimpleConnectionPool(
-                1, self.pool_size,
+                5,  # minconn
+                self.pool_size,  # maxconn
                 user=url.username,
                 password=url.password,
                 host=url.hostname,
@@ -122,38 +124,76 @@ class DatabasePool:
 
     @asynccontextmanager
     async def connection(self):
-        """Mejorado manejo de conexiones con retry"""
-        conn = None
-        max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
-            try:
-                async with self._lock:
+        """Mejorado manejo de conexiones con semáforo"""
+        async with self._connection_semaphore:  # Limitar conexiones concurrentes
+            conn = None
+            max_retries = 3
+            retry_count = 0
+            
+            while retry_count < max_retries:
+                try:
                     conn = self.get_connection()
-                    conn.autocommit = True  # Prevenir transacciones colgadas
-                    yield conn
-                    return
-            except psycopg2.OperationalError:
-                retry_count += 1
-                if conn:
-                    try:
+                    if conn:
+                        conn.autocommit = True
+                        yield conn
+                        return
+                except psycopg2.OperationalError as e:
+                    retry_count += 1
+                    logger.warning(f"Connection attempt {retry_count} failed: {e}")
+                    if conn:
+                        try:
+                            self.put_connection(conn)
+                        except:
+                            pass
+                    if retry_count == max_retries:
+                        raise
+                    await asyncio.sleep(0.5 * retry_count)  # Backoff exponencial
+                finally:
+                    if conn:
                         self.put_connection(conn)
-                    except:
-                        pass
-                if retry_count == max_retries:
+
+    async def get_user(self, user_id: str) -> Optional[Dict]:
+        """Get user with connection retry"""
+        # Check cache first
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+        
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with self.connection() as conn:
+                    with conn.cursor(cursor_factory=DictCursor) as cur:
+                        cur.execute("""
+                            SELECT user_id, username, balance, total_earned, 
+                                   referrals, last_claim, last_daily, wallet, 
+                                   referred_by, join_date
+                            FROM users 
+                            WHERE user_id = %s
+                        """, (user_id,))
+                        
+                        result = cur.fetchone()
+                        if result:
+                            user_data = dict(result)
+                            user_data["last_claim"] = user_data["last_claim"].isoformat() if user_data["last_claim"] else None
+                            user_data["last_daily"] = user_data["last_daily"].isoformat() if user_data["last_daily"] else None
+                            user_data["join_date"] = user_data["join_date"].isoformat() if user_data["join_date"] else None
+                            self.user_cache[user_id] = user_data
+                            return user_data
+                        return None
+                        
+            except psycopg2.OperationalError as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Final attempt failed for user {user_id}: {e}")
                     raise
-                await asyncio.sleep(1)
-            finally:
-                if conn:
-                    self.put_connection(conn)
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                logger.error(f"Error getting user {user_id}: {e}")
+                raise
 
     async def save_user(self, user_data: dict):
-        """Guardar usuario con mejor manejo de errores"""
+        """Save user with improved connection handling"""
         max_retries = 3
-        retry_count = 0
-        
-        while retry_count < max_retries:
+        for attempt in range(max_retries):
             try:
                 async with self.connection() as conn:
                     with conn.cursor() as cur:
@@ -183,15 +223,16 @@ class DatabasePool:
                             user_data.get("referred_by"),
                             datetime.fromisoformat(user_data.get("join_date", datetime.now(UTC).isoformat()))
                         ))
-                        conn.commit()
                         self.user_cache[user_data["user_id"]] = user_data.copy()
                         return
-            except Exception as e:
-                retry_count += 1
-                logger.error(f"Error saving user (attempt {retry_count}): {e}")
-                if retry_count == max_retries:
+            except psycopg2.OperationalError as e:
+                if attempt == max_retries - 1:
+                    logger.error(f"Final save attempt failed: {e}")
                     raise
-                await asyncio.sleep(1)
+                await asyncio.sleep(0.5 * (attempt + 1))
+            except Exception as e:
+                logger.error(f"Error saving user: {e}")
+                raise
 
     async def optimize_db(self):
         """Optimize database performance for PostgreSQL"""
@@ -199,41 +240,6 @@ class DatabasePool:
             with conn.cursor() as cur:
                 # Cambiado a comandos PostgreSQL
                 cur.execute("VACUUM ANALYZE users")
-
-    async def get_user(self, user_id: str) -> Optional[Dict]:
-        """Get user data from cache or database"""
-        # Check cache first
-        if user_id in self.user_cache:
-            return self.user_cache[user_id]
-        
-        # Get from database
-        try:
-            conn = self.get_connection()
-            with conn.cursor(cursor_factory=DictCursor) as cur:
-                cur.execute("""
-                    SELECT user_id, username, balance, total_earned, 
-                           referrals, last_claim, last_daily, wallet, 
-                           referred_by, join_date
-                    FROM users 
-                    WHERE user_id = %s
-                """, (user_id,))
-                
-                result = cur.fetchone()
-                if result:
-                    # Convert to dict and cache
-                    user_data = dict(result)
-                    # Convert datetime to ISO format string
-                    user_data["last_claim"] = user_data["last_claim"].isoformat()
-                    user_data["last_daily"] = user_data["last_daily"].isoformat()
-                    user_data["join_date"] = user_data["join_date"].isoformat()
-                    # Cache the result
-                    self.user_cache[user_id] = user_data
-                    return user_data
-                return None
-                
-        except Exception as e:
-            logger.error(f"Error getting user {user_id}: {e}")
-            return None
 
 class SUIBot:
     def __init__(self):

@@ -708,6 +708,13 @@ class SUIBot:
 
 async def main():
     """Initialize and start the bot with proper error handling"""
+    # Initialize logging
+    logging.basicConfig(
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+        level=logging.INFO
+    )
+    logger = logging.getLogger(__name__)
+
     bot = None
     try:
         # Initialize bot
@@ -717,12 +724,9 @@ async def main():
         await bot.init_db()
         logger.info("Database initialized successfully")
         
-        # Initialize application with error handlers
+        # Initialize application
         application = Application.builder().token(bot.token).build()
         bot.application = application
-
-        # Add error handler
-        application.add_error_handler(error_handler)
 
         # Add handlers
         application.add_handler(CommandHandler("start", bot.start))
@@ -732,10 +736,15 @@ async def main():
             filters.TEXT & ~filters.COMMAND,
             bot.handle_message
         ))
+
+        # Add error handler
+        application.add_error_handler(error_handler)
         
         logger.info("Bot started successfully!")
         
-        # Simplified polling setup
+        # Start polling with clean startup
+        await application.initialize()
+        await application.start()
         await application.run_polling(
             drop_pending_updates=True,
             allowed_updates=Update.ALL_TYPES,
@@ -744,11 +753,10 @@ async def main():
         
     except Exception as e:
         logger.error(f"Critical error starting bot: {str(e)}")
-        if bot and bot.db_pool:
+        if bot and hasattr(bot, 'db_pool'):
             await bot.db_pool.close()
-        raise  # Let the outer handler deal with exit
+        sys.exit(1)
 
-# Add error handler function
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors in the telegram bot."""
     logger.error(f"Exception while handling an update: {context.error}")
@@ -764,14 +772,31 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 if __name__ == "__main__":
     try:
-        # Set up signal handlers
-        for signal_type in (SIGINT, SIGTERM, SIGABRT):
-            signal(signal_type, lambda s, f: asyncio.get_event_loop().stop())
+        # Clean up any existing event loops
+        try:
+            loop = asyncio.get_event_loop()
+            if loop.is_running():
+                loop.stop()
+                loop.close()
+        except Exception:
+            pass
+        
+        # Create new event loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        
+        # Apply nest_asyncio
+        nest_asyncio.apply()
         
         # Run the bot
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        logger.info("Bot stopped")
+        loop.run_until_complete(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
     except Exception as e:
         logger.error(f"Fatal error: {str(e)}")
         sys.exit(1)
+    finally:
+        try:
+            loop.close()
+        except Exception:
+            pass

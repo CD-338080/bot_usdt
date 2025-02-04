@@ -18,6 +18,10 @@ from urllib.parse import urlparse
 from signal import signal, SIGINT, SIGTERM, SIGABRT
 import time
 import telegram
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -424,7 +428,7 @@ class USDTBot:
             await update.message.reply_text(
                 f"💸 Reward Collected!\n"
                 f"──────────────────\n"
-                f"�� Earned: {REWARDS['claim']} USDT\n"
+                f"💰 Earned: {REWARDS['claim']} USDT\n"
                 f"💵 Balance: {new_balance:.2f} USDT\n"
                 f"──────────────────\n"
                 f"⏱ Next reward in 5 minutes"
@@ -471,7 +475,7 @@ class USDTBot:
             await update.message.reply_text(
                 f"💵 Daily Bonus Collected!\n"
                 f"──────────────────\n"
-                f"�� Earned: {REWARDS['daily']} USDT\n"
+                f"💰 Earned: {REWARDS['daily']} USDT\n"
                 f"💵 Balance: {new_balance:.2f} USDT\n"
                 f"──────────────────\n"
                 f"⏱ Next bonus in 24 hours"

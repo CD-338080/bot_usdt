@@ -626,48 +626,57 @@ class SUIBot:
         )
 
     async def handle_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin commands"""
+        """Handle admin commands with improved security"""
+        if not update.message:
+            return
+            
         user_id = str(update.effective_user.id)
-        if user_id != self.admin_id:
+        
+        # Verificación de admin mejorada
+        if user_id != str(self.admin_id):  # Convertir ambos a string para comparación segura
+            logger.warning(f"Unauthorized admin access attempt from user {user_id}")
             await update.message.reply_text("❌ You are not authorized to use admin commands.")
             return
 
         if not context.args:
             await update.message.reply_text(
                 "📋 Admin Commands:\n"
-                "/admin stats - Show bot statistics\n"
-                "/admin broadcast - Send message to all users\n"
-                "/admin addbalance - Add balance to user\n"
-                "/admin removeuser - Remove user from bot"
+                "──────────────────\n"
+                "/admin stats - Show statistics\n"
+                "/admin broadcast <message> - Send to all\n"
+                "/admin addbalance <user_id> <amount> - Add balance\n"
+                "/admin removeuser <user_id> - Remove user\n"
+                "──────────────────"
             )
             return
 
         command = context.args[0].lower()
-
         try:
             if command == "stats":
                 await self.handle_admin_stats(update)
-            elif command == "broadcast":
+            elif command == "broadcast" and len(context.args) > 1:
                 message = ' '.join(context.args[1:])
                 await self.handle_admin_broadcast(update, message)
-            elif command == "addbalance":
-                if len(context.args) != 3:
-                    await update.message.reply_text("❌ Usage: /admin addbalance <user_id> <amount>")
-                    return
+            elif command == "addbalance" and len(context.args) == 3:
                 user_id = context.args[1]
                 amount = context.args[2]
                 await self.handle_admin_add_balance(update, user_id, amount)
-            elif command == "removeuser":
-                if len(context.args) != 2:
-                    await update.message.reply_text("❌ Usage: /admin removeuser <user_id>")
-                    return
+            elif command == "removeuser" and len(context.args) == 2:
                 user_id = context.args[1]
                 await self.handle_admin_remove_user(update, user_id)
             else:
-                await update.message.reply_text("❌ Unknown admin command")
+                await update.message.reply_text(
+                    "❌ Invalid command format\n"
+                    "──────────────────\n"
+                    "Use /admin for command list"
+                )
         except Exception as e:
             logger.error(f"Admin command error: {e}")
-            await update.message.reply_text("❌ Error executing admin command")
+            await update.message.reply_text(
+                "❌ Error executing command\n"
+                "──────────────────\n"
+                "Please check logs for details"
+            )
 
     async def handle_admin_stats(self, update: Update):
         """Handle admin stats command"""
@@ -876,7 +885,8 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to send error message: {e}")
 
 def main():
-    """Start the bot"""
+    """Start the bot with improved command handling"""
+    # Create application
     application = Application.builder().token(TOKEN).build()
     bot = SUIBot()
     bot.application = application
@@ -884,10 +894,15 @@ def main():
     # Initialize database
     asyncio.get_event_loop().run_until_complete(bot.init_db())
 
-    # Add handlers
+    # Add handlers with proper command handling
     application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    application.add_handler(CommandHandler("admin", bot.handle_admin_command))
+    application.add_handler(CommandHandler("admin", bot.handle_admin_command))  # Admin commands
+    application.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, 
+        bot.handle_message
+    ))
+
+    # Add error handler
     application.add_error_handler(error_handler)
 
     logger.info("Bot started successfully!")

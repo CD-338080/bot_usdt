@@ -784,7 +784,9 @@ class SUIBot:
                 conn = self.db_pool.get_connection()
                 with conn.cursor(cursor_factory=DictCursor) as cur:
                     cur.execute("""
-                        SELECT user_id, last_claim, last_daily 
+                        SELECT user_id, 
+                               last_claim AT TIME ZONE 'UTC' as last_claim, 
+                               last_daily AT TIME ZONE 'UTC' as last_daily 
                         FROM users 
                         WHERE last_claim < NOW() - INTERVAL '5 minutes'
                         OR last_daily < NOW() - INTERVAL '24 hours'
@@ -794,24 +796,31 @@ class SUIBot:
                     
                     for row in rows:
                         try:
-                            user_data = dict(row)
-                            last_claim = datetime.fromisoformat(user_data["last_claim"])
-                            last_daily = datetime.fromisoformat(user_data["last_daily"])
-                            user_id = user_data["user_id"]
+                            user_id = row['user_id']
+                            last_claim = row['last_claim']
+                            last_daily = row['last_daily']
+                            
+                            now = datetime.now()
+                            
+                            # Convertir timestamps a datetime si no lo son
+                            if isinstance(last_claim, str):
+                                last_claim = datetime.fromisoformat(last_claim.replace('Z', '+00:00'))
+                            if isinstance(last_daily, str):
+                                last_daily = datetime.fromisoformat(last_daily.replace('Z', '+00:00'))
 
-                            if datetime.now() - last_daily > timedelta(days=1):
+                            if now - last_daily > timedelta(days=1):
                                 await self.application.bot.send_message(
                                     chat_id=user_id,
                                     text="📅 Your daily bonus is ready!\nCome back to claim it!"
                                 )
                             
-                            if datetime.now() - last_claim > timedelta(minutes=5):  # Cambiado a 5 minutos
+                            if now - last_claim > timedelta(minutes=5):
                                 await self.application.bot.send_message(
                                     chat_id=user_id,
                                     text="🌟 Hey! Collect your bonus\nClaim it now!"
                                 )
                         except Exception as e:
-                            logger.error(f"Error processing notification: {e}")
+                            logger.error(f"Error processing notification for {user_id}: {e}")
                         await asyncio.sleep(0.05)
                         
             except Exception as e:
@@ -819,8 +828,7 @@ class SUIBot:
             finally:
                 if conn:
                     self.db_pool.put_connection(conn)
-                # Check every minute instead of every hour
-                await asyncio.sleep(60)  # Reducido a 1 minuto para ser más responsivo
+                await asyncio.sleep(60)
 
     async def handle_invite(self, update: Update):
         """Handle invite command"""

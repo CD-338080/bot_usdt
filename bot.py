@@ -172,6 +172,7 @@ class DatabasePool:
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from cache or database"""
+        conn = None
         try:
             # Check cache first
             if user_id in self.user_cache:
@@ -253,7 +254,48 @@ class SUIBot:
 
     async def save_user(self, user_data: dict):
         """Save user data to database"""
-        await self.db_pool.save_user(user_data)
+        conn = None
+        try:
+            conn = self.db_pool.get_connection()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    INSERT INTO users 
+                    (user_id, username, balance, total_earned, referrals, 
+                    last_claim, last_daily, wallet, referred_by)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON CONFLICT (user_id) DO UPDATE SET
+                    username = EXCLUDED.username,
+                    balance = EXCLUDED.balance,
+                    total_earned = EXCLUDED.total_earned,
+                    referrals = EXCLUDED.referrals,
+                    last_claim = EXCLUDED.last_claim,
+                    last_daily = EXCLUDED.last_daily,
+                    wallet = EXCLUDED.wallet,
+                    referred_by = EXCLUDED.referred_by
+                """, (
+                    user_data["user_id"],
+                    user_data["username"],
+                    user_data["balance"],
+                    user_data["total_earned"],
+                    user_data["referrals"],
+                    datetime.fromisoformat(user_data["last_claim"]),
+                    datetime.fromisoformat(user_data["last_daily"]),
+                    user_data.get("wallet"),
+                    user_data.get("referred_by")
+                ))
+                conn.commit()
+                
+                # Update cache
+                self.user_cache[user_data["user_id"]] = user_data.copy()
+                
+        except Exception as e:
+            logger.error(f"Error saving user data: {e}")
+            if conn:
+                conn.rollback()
+            raise
+        finally:
+            if conn:
+                self.db_pool.put_connection(conn)
 
     async def _notify_referrer(self, bot, referrer_id: str):
         """Notify referrer about new referral"""
@@ -413,7 +455,7 @@ class SUIBot:
                     f"──────────────────\n"
                     f"⌚ {hours}h {minutes}m\n"
                     f"──────────────────\n"
-                    f"💡 Come back tomorrow!"
+                    f"�� Come back tomorrow!"
                 )
                 return
 

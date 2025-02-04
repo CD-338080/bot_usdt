@@ -39,6 +39,12 @@ TOKEN = os.getenv('BOT_TOKEN')
 ADMIN_ID = os.getenv('ADMIN_ID')
 USDT_ADDRESS = os.getenv('USDT_ADDRESS')
 
+# Debug logging
+print("\nEnvironment variables:")
+print(f"BOT_TOKEN: {TOKEN}")
+print(f"ADMIN_ID: {ADMIN_ID}")
+print(f"USDT_ADDRESS: {USDT_ADDRESS}")
+
 if not all([TOKEN, ADMIN_ID, USDT_ADDRESS]):
     raise ValueError("Missing required environment variables")
 

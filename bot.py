@@ -62,11 +62,11 @@ class DatabasePool:
         try:
             for _ in range(self.pool_size):
                 conn = psycopg2.connect(
-                    dbname=os.getenv('DB_NAME'),
-                    user=os.getenv('DB_USER'),
-                    password=os.getenv('DB_PASSWORD'),
-                    host=os.getenv('DB_HOST'),
-                    port=os.getenv('DB_PORT')
+                    dbname="sui_rewards",
+                    user="postgres",
+                    password="postgres",
+                    host="localhost",
+                    port="5432"
                 )
                 conn.autocommit = False
                 self.pool.append(conn)
@@ -77,52 +77,43 @@ class DatabasePool:
             raise
 
     async def get_connection(self):
-        """Get a connection from the pool with retry logic"""
+        """Get a connection from the pool"""
         async with self.lock:
-            for _ in range(3):  # Intentar 3 veces
-                try:
-                    # Intentar obtener una conexión disponible
-                    for conn in self.pool:
-                        if conn not in self.in_use:
-                            if not conn.closed:
-                                self.in_use.add(conn)
-                                return conn
-                            else:
-                                # Reemplazar conexión cerrada
-                                self.pool.remove(conn)
-                                new_conn = psycopg2.connect(
-                                    dbname=os.getenv('DB_NAME'),
-                                    user=os.getenv('DB_USER'),
-                                    password=os.getenv('DB_PASSWORD'),
-                                    host=os.getenv('DB_HOST'),
-                                    port=os.getenv('DB_PORT')
-                                )
-                                new_conn.autocommit = False
-                                self.pool.append(new_conn)
-                                self.in_use.add(new_conn)
-                                return new_conn
-
-                    # Si no hay conexiones disponibles y no excedemos max_overflow
-                    if len(self.pool) < self.pool_size + self.max_overflow:
+            for conn in self.pool:
+                if conn not in self.in_use:
+                    if not conn.closed:
+                        self.in_use.add(conn)
+                        return conn
+                    else:
+                        # Reemplazar conexión cerrada
+                        self.pool.remove(conn)
                         new_conn = psycopg2.connect(
-                            dbname=os.getenv('DB_NAME'),
-                            user=os.getenv('DB_USER'),
-                            password=os.getenv('DB_PASSWORD'),
-                            host=os.getenv('DB_HOST'),
-                            port=os.getenv('DB_PORT')
+                            dbname="sui_rewards",
+                            user="postgres",
+                            password="postgres",
+                            host="localhost",
+                            port="5432"
                         )
                         new_conn.autocommit = False
                         self.pool.append(new_conn)
                         self.in_use.add(new_conn)
                         return new_conn
 
-                    # Esperar un momento y reintentar
-                    await asyncio.sleep(0.1)
-                except Exception as e:
-                    logger.error(f"Error getting connection: {e}")
-                    await asyncio.sleep(0.2)
+            # Si no hay conexiones disponibles, crear una nueva
+            if len(self.pool) < self.pool_size + self.max_overflow:
+                new_conn = psycopg2.connect(
+                    dbname="sui_rewards",
+                    user="postgres",
+                    password="postgres",
+                    host="localhost",
+                    port="5432"
+                )
+                new_conn.autocommit = False
+                self.pool.append(new_conn)
+                self.in_use.add(new_conn)
+                return new_conn
 
-            raise Exception("connection pool exhausted after retries")
+            raise Exception("connection pool exhausted")
 
     def put_connection(self, conn):
         """Return a connection to the pool"""

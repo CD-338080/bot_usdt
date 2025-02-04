@@ -125,9 +125,22 @@ class DatabasePool:
                         last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         wallet TEXT,
+                        join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         FOREIGN KEY (referred_by) REFERENCES users(user_id)
                     )
                 """)
+                # Verificar si la columna join_date existe
+                cur.execute("""
+                    SELECT column_name 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'users' AND column_name = 'join_date'
+                """)
+                if not cur.fetchone():
+                    # Si no existe, agregar la columna
+                    cur.execute("""
+                        ALTER TABLE users 
+                        ADD COLUMN join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    """)
                 conn.commit()
                 logger.info("Database tables initialized successfully")
         except Exception as e:

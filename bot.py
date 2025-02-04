@@ -207,6 +207,18 @@ class DatabasePool:
             if conn:
                 self.put_connection(conn)
 
+# Primero definimos el error_handler
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again later!"
+            )
+    except Exception as e:
+        logger.error(f"Error in error handler: {e}")
+
 class SUIBot:
     def __init__(self):
         # Validate environment variables
@@ -896,6 +908,8 @@ def main():
     
     # Admin commands
     application.add_handler(CommandHandler("admin", bot.handle_admin_command))
+    application.add_handler(CommandHandler("stats", bot.handle_stats))
+    application.add_handler(CommandHandler("mailing", bot.handle_mailing))
     
     # Error handler
     application.add_error_handler(error_handler)
@@ -906,14 +920,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
-    try:
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ An error occurred. Please try again later!"
-            )
-    except Exception as e:
-        logger.error(f"Error in error handler: {e}")

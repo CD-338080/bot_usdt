@@ -828,7 +828,7 @@ class USDTBot:
                     await update.message.reply_text(
                         f"📊 Bot Statistics\n"
                         f"──────────────────\n"
-                        f"�� Community: {total_users:,}\n"
+                        f" Community: {total_users:,}\n"
                         f"📱 Active Users (24h): {active_users:,}\n"
                         f"💰 Total Balance: {total_balance:.2f} USDT\n"
                         f"💎 Total Earned: {total_earned:.2f} USDT\n"

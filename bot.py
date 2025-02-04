@@ -268,88 +268,51 @@ class SUIBot:
             
             # Si es un usuario nuevo
             if not user_data:
-                # Crear datos básicos del usuario
+                # Procesar referido si existe
+                referred_by = None
+                if context.args:
+                    referrer_id = context.args[0]
+                    if referrer_id != user_id:  # Evitar auto-referidos
+                        referrer_data = await self.get_user(referrer_id)
+                        if referrer_data:
+                            referred_by = referrer_id
+                            # Actualizar referidor
+                            referrer_data["referrals"] = int(referrer_data.get("referrals", 0)) + 1
+                            referrer_balance = Decimal(referrer_data["balance"]) + REWARDS["referral"]
+                            referrer_total = Decimal(referrer_data["total_earned"]) + REWARDS["referral"]
+                            referrer_data.update({
+                                "balance": str(referrer_balance),
+                                "total_earned": str(referrer_total)
+                            })
+                            await self.save_user(referrer_data)
+                            
+                            # Notificar al referidor
+                            try:
+                                await context.bot.send_message(
+                                    chat_id=referrer_id,
+                                    text=f"🎉 New Referral!\n"
+                                         f"User: @{user.username or 'Anonymous'}\n"
+                                         f"Reward: +{REWARDS['referral']} SUI"
+                                )
+                            except Exception as e:
+                                logger.error(f"Failed to notify referrer: {e}")
+
+                # Crear nuevo usuario
                 user_data = {
                     "user_id": user_id,
                     "username": user.username or "Anonymous",
-                    "balance": "0",
-                    "total_earned": "0",
+                    "balance": str(REWARDS["referral"] if referred_by else "0"),
+                    "total_earned": str(REWARDS["referral"] if referred_by else "0"),
                     "referrals": 0,
-                    "referred_by": None,
+                    "referred_by": referred_by,
                     "last_claim": datetime.now(UTC).isoformat(),
                     "last_daily": datetime.now(UTC).isoformat(),
-                    "wallet": None
+                    "wallet": None,
+                    "join_date": datetime.now(UTC).isoformat()
                 }
-                
-                # Procesar referido si existe
-                if context.args and context.args[0] != user_id:
-                    referrer_id = context.args[0]
-                    referrer_data = await self.get_user(referrer_id)
-                    
-                    if referrer_data:
-                        # Actualizar datos del usuario nuevo
-                        user_data["referred_by"] = referrer_id
-                        
-                        # Actualizar datos del referidor
-                        referrer_data["referrals"] = referrer_data.get("referrals", 0) + 1
-                        new_balance = Decimal(referrer_data["balance"]) + REWARDS["referral"]
-                        new_total = Decimal(referrer_data["total_earned"]) + REWARDS["referral"]
-                        referrer_data.update({
-                            "balance": str(new_balance),
-                            "total_earned": str(new_total)
-                        })
-                        
-                        # Guardar datos del referidor
-                        await self.save_user(referrer_data)
-                        
-                        # Dar bonus al nuevo usuario
-                        user_data["balance"] = str(REWARDS["referral"])
-                        user_data["total_earned"] = str(REWARDS["referral"])
-                        
-                        # Notificar al referidor
-                        try:
-                            await context.bot.send_message(
-                                chat_id=referrer_id,
-                                text=(
-                                    f"🎉 New Referral Bonus!\n"
-                                    f"──────────────────\n"
-                                    f"👤 User: @{user.username or 'Anonymous'}\n"
-                                    f"💰 Earned: +{REWARDS['referral']} SUI\n"
-                                    f"📊 Total Referrals: {referrer_data['referrals']}"
-                                )
-                            )
-                        except Exception as e:
-                            logger.error(f"Failed to notify referrer: {e}")
-
-                # Guardar nuevo usuario
                 await self.save_user(user_data)
-                
-                # Mensaje de bienvenida para nuevo usuario
-                welcome_message = (
-                    f"🎉 Welcome to SUI Rewards Bot!\n"
-                    f"──────────────────\n"
-                    f"💰 Start earning SUI by:\n"
-                    f"• 🕒 Collecting bonuses\n"
-                    f"• 📅 Daily rewards\n"
-                    f"• 👥 Inviting friends\n"
-                    f"──────────────────\n"
-                )
-                
-                if user_data["referred_by"]:
-                    welcome_message += (
-                        f"✨ Referral Bonus: +{REWARDS['referral']} SUI\n"
-                        f"Thanks for using a referral link!"
-                    )
-            else:
-                welcome_message = (
-                    f"👋 Welcome back!\n"
-                    f"──────────────────\n"
-                    f"💎 Balance: {user_data['balance']} SUI\n"
-                    f"👥 Referrals: {user_data['referrals']}\n"
-                    f"──────────────────"
-                )
 
-            # Crear teclado
+            # Mensaje de bienvenida
             keyboard = [
                 ["🌟 Collect", "📅 Daily Reward"],
                 ["📊 My Stats", "👨‍👦‍👦 Invite"],
@@ -358,26 +321,29 @@ class SUIBot:
             ]
             reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
             
-            # Enviar mensaje con teclado
-            await update.message.reply_text(
-                welcome_message,
-                reply_markup=reply_markup
+            welcome_text = (
+                f"👋 {'Welcome' if not user_data.get('referred_by') else 'Welcome! +3 SUI Bonus'}\n"
+                f"──────────────────\n"
+                f"💰 Balance: {user_data['balance']} SUI\n"
+                f"👥 Referrals: {user_data['referrals']}\n"
+                f"──────────────────\n"
+                f"Start earning now! 🚀"
             )
+            
+            await update.message.reply_text(welcome_text, reply_markup=reply_markup)
 
         except Exception as e:
-            logger.error(f"Error in start handler: {e}")
-            await update.message.reply_text(
-                "❌ An error occurred. Please try again!"
-            )
+            logger.error(f"Error in start: {e}")
+            await update.message.reply_text("❌ An error occurred. Please try again!")
 
     async def handle_claim(self, update: Update, user_data: dict):
-        """Improved claim handler with better error handling"""
+        """Handle claim command"""
         try:
-            now = datetime.now()
+            now = datetime.now(UTC)
             last_claim = datetime.fromisoformat(user_data["last_claim"])
             
-            if now - last_claim < timedelta(minutes=5):  # Cambiado a 5 minutos
-                time_left = timedelta(minutes=5) - (now - last_claim)
+            if now.replace(tzinfo=None) - last_claim.replace(tzinfo=None) < timedelta(minutes=5):
+                time_left = timedelta(minutes=5) - (now.replace(tzinfo=None) - last_claim.replace(tzinfo=None))
                 minutes = int(time_left.total_seconds() // 60)
                 seconds = int(time_left.total_seconds() % 60)
                 
@@ -418,13 +384,13 @@ class SUIBot:
             await update.message.reply_text("❌ An error occurred. Please try again!")
 
     async def handle_daily(self, update: Update, user_data: dict):
-        """Improved daily handler with better validation"""
+        """Handle daily command"""
         try:
-            now = datetime.now()
+            now = datetime.now(UTC)
             last_daily = datetime.fromisoformat(user_data["last_daily"])
             
-            if now - last_daily < timedelta(days=1):
-                time_left = timedelta(days=1) - (now - last_daily)
+            if now.replace(tzinfo=None) - last_daily.replace(tzinfo=None) < timedelta(days=1):
+                time_left = timedelta(days=1) - (now.replace(tzinfo=None) - last_daily.replace(tzinfo=None))
                 hours = int(time_left.total_seconds() // 3600)
                 minutes = int((time_left.total_seconds() % 3600) // 60)
                 

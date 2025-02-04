@@ -75,39 +75,43 @@ REWARDS = {
 }
 
 class DatabasePool:
-    def __init__(self, pool_size=50):  # Aumentado el tamaño del pool
+    def __init__(self, pool_size=20, max_retries=3):
         self.pool_size = pool_size
+        self.max_retries = max_retries
         self.pool = None
-        self.user_cache = TTLCache(maxsize=10000, ttl=300)
-        self._lock = asyncio.Lock()
-        self._connection_semaphore = asyncio.Semaphore(pool_size)
-
+        self._connection_semaphore = asyncio.Semaphore(pool_size // 2)  # Limitar conexiones concurrentes
+        self.user_cache = TTLCache(maxsize=10000, ttl=300)  # Cache para reducir consultas
+        
     async def initialize(self):
-        """Initialize database pool with better connection management"""
-        try:
-            DATABASE_URL = os.getenv('DATABASE_URL')
-            if not DATABASE_URL:
-                raise ValueError("DATABASE_URL environment variable is required")
-
-            url = urlparse(DATABASE_URL)
-            self.pool = SimpleConnectionPool(
-                5,  # minconn
-                self.pool_size,  # maxconn
-                user=url.username,
-                password=url.password,
-                host=url.hostname,
-                port=url.port,
-                database=url.path[1:],
-                sslmode='require'
-            )
-            
-            # Initialize tables
-            self._initialize_tables()
-            logger.info("Database initialized successfully")
-            
-        except Exception as e:
-            logger.error(f"Database initialization error: {e}")
-            raise
+        """Initialize database pool with retry logic"""
+        retry_count = 0
+        while retry_count < self.max_retries:
+            try:
+                if not self.pool:
+                    db_url = os.getenv('DATABASE_URL')
+                    if not db_url:
+                        raise ValueError("DATABASE_URL not set")
+                    
+                    self.pool = SimpleConnectionPool(
+                        minconn=5,
+                        maxconn=self.pool_size,
+                        dsn=db_url,
+                        connect_timeout=3
+                    )
+                    
+                    # Verificar conexión
+                    conn = self.pool.getconn()
+                    self.pool.putconn(conn)
+                    
+                    await self._initialize_tables()
+                    logger.info(f"Database pool initialized with size {self.pool_size}")
+                    return
+            except Exception as e:
+                retry_count += 1
+                logger.error(f"Database initialization attempt {retry_count} failed: {e}")
+                if retry_count == self.max_retries:
+                    raise
+                await asyncio.sleep(1 * retry_count)
 
     def _initialize_tables(self):
         """Initialize database tables"""
@@ -150,27 +154,18 @@ class DatabasePool:
             if conn:
                 self.pool.putconn(conn)
 
-    def get_connection(self):
-        """Get a database connection from the pool"""
-        if not self.pool:
-            raise Exception("Database pool not initialized")
-        return self.pool.getconn()
-
-    def put_connection(self, conn):
-        """Return a connection to the pool"""
-        if self.pool:
-            self.pool.putconn(conn)
-
     @asynccontextmanager
     async def connection(self):
-        """Mejorado manejo de conexiones con semáforo"""
+        """Mejorado manejo de conexiones con semáforo y retry"""
         async with self._connection_semaphore:  # Limitar conexiones concurrentes
             conn = None
-            max_retries = 3
             retry_count = 0
             
-            while retry_count < max_retries:
+            while retry_count < self.max_retries:
                 try:
+                    if not self.pool:
+                        await self.initialize()
+                    
                     conn = self.get_connection()
                     if conn:
                         conn.autocommit = True
@@ -184,12 +179,51 @@ class DatabasePool:
                             self.put_connection(conn)
                         except:
                             pass
-                    if retry_count == max_retries:
+                    
+                    # Si el pool está exhausto, intentar reiniciarlo
+                    if "connection pool exhausted" in str(e):
+                        try:
+                            logger.info("Attempting to reinitialize pool...")
+                            self.pool = None
+                            await self.initialize()
+                        except Exception as init_error:
+                            logger.error(f"Pool reinitialization failed: {init_error}")
+                    
+                    if retry_count == self.max_retries:
                         raise
                     await asyncio.sleep(0.5 * retry_count)  # Backoff exponencial
                 finally:
                     if conn:
                         self.put_connection(conn)
+
+    def get_connection(self):
+        """Get connection with validation"""
+        if not self.pool:
+            raise Exception("Database pool not initialized")
+        conn = self.pool.getconn()
+        try:
+            # Verificar si la conexión está viva
+            conn.cursor().execute("SELECT 1")
+            return conn
+        except:
+            # Si la conexión está muerta, cerrarla y obtener una nueva
+            try:
+                self.pool.putconn(conn, close=True)
+            except:
+                pass
+            return self.pool.getconn()
+
+    def put_connection(self, conn):
+        """Return connection to pool with safety checks"""
+        if self.pool and conn:
+            try:
+                self.pool.putconn(conn)
+            except Exception as e:
+                logger.error(f"Error returning connection to pool: {e}")
+                try:
+                    conn.close()
+                except:
+                    pass
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user with connection retry"""
@@ -279,7 +313,10 @@ class DatabasePool:
 
 class USDTBot:
     def __init__(self):
-        self.db_pool = DatabasePool(pool_size=20)
+        self.db_pool = DatabasePool(
+            pool_size=50,  # Aumentado de 20 a 50
+            max_retries=3
+        )
         self.admin_id = str(ADMIN_ID)
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         self.application = None

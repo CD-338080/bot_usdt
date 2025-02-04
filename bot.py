@@ -172,18 +172,18 @@ class DatabasePool:
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from cache or database"""
-        # Check cache first
-        if user_id in self.user_cache:
-            return self.user_cache[user_id]
-        
-        # Get from database
         try:
+            # Check cache first
+            if user_id in self.user_cache:
+                return self.user_cache[user_id]
+            
+            # Get from database
             conn = self.get_connection()
             with conn.cursor(cursor_factory=DictCursor) as cur:
                 cur.execute("""
                     SELECT user_id, username, balance, total_earned, 
                            referrals, last_claim, last_daily, wallet, 
-                           referred_by, join_date
+                           referred_by
                     FROM users 
                     WHERE user_id = %s
                 """, (user_id,))
@@ -195,7 +195,6 @@ class DatabasePool:
                     # Convert datetime to ISO format string
                     user_data["last_claim"] = user_data["last_claim"].isoformat()
                     user_data["last_daily"] = user_data["last_daily"].isoformat()
-                    user_data["join_date"] = user_data["join_date"].isoformat()
                     # Cache the result
                     self.user_cache[user_id] = user_data
                     return user_data
@@ -204,6 +203,9 @@ class DatabasePool:
         except Exception as e:
             logger.error(f"Error getting user {user_id}: {e}")
             return None
+        finally:
+            if conn:
+                self.put_connection(conn)
 
 class SUIBot:
     def __init__(self):
@@ -727,53 +729,50 @@ class SUIBot:
                 self.db_pool.put_connection(conn)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all messages"""
         if not update.message or not update.message.text:
-            await update.message.reply_text("⚡ Please send /start to begin")
             return
 
-        text = update.message.text
         user_id = str(update.effective_user.id)
+        text = update.message.text
+
+        # Get user data
+        user_data = await self.get_user(user_id)
+        if not user_data:
+            await self.start(update, context)
+            return
+
+        # Handle different commands
+        if text == "🌟 Collect":
+            await self.handle_claim(update, user_data)
+        elif text == "📅 Daily Reward":
+            await self.handle_daily(update, user_data)
+        elif text == "📊 My Stats":
+            await self.handle_balance(update, user_data)
+        elif text == "👨‍👦‍👦 Invite":
+            await self.handle_referral(update, context, user_data)
+        elif text == "💸 Cash Out":
+            await self.handle_withdraw(update, user_data)
+        elif text == "🔑 SUI Address":
+            await self.handle_wallet(update)
+        elif text == "🏆 Leaders":
+            await self.handle_ranking(update)
+        elif text == "❓ Info":
+            await self.handle_help(update)
+
+    async def handle_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle admin commands"""
+        user_id = str(update.effective_user.id)
+        if user_id != self.admin_id:
+            return
+
+        command = context.args[0] if context.args else ""
         
-        try:
-            user_data = await self.get_user(user_id)
-            if not user_data:
-                await update.message.reply_text("⚡ Please send /start to begin")
-                return
-
-            # Handle wallet address - accept any text but show warning
-            if len(text) > 25 and not text.startswith('/'):  # Basic check for potential address
-                user_data["wallet"] = text
-                asyncio.create_task(self.save_user(user_data))
-                await update.message.reply_text(
-                    "✅ SUI address saved!\n\n"
-                    "⚠️ IMPORTANT:\n"
-                    "• Verify your address is correct\n"
-                    "• Wrong addresses will result in lost funds\n"
-                    "• No recovery possible for incorrect addresses"
-                )
-                return
-
-            # Command mapping to handlers
-            handlers = {
-                "🌟 Collect": (self.handle_claim, (update, user_data)),
-                "📅 Daily Reward": (self.handle_daily, (update, user_data)),
-                "📊 My Stats": (self.handle_balance, (update, user_data)),
-                "👨‍👦‍👦 Invite": (self.handle_referral, (update, context, user_data)),
-                "💸 Cash Out": (self.handle_withdraw, (update, user_data)),
-                "🔑 SUI Address": (self.handle_wallet, (update,)),
-                "🏆 Leaders": (self.handle_ranking, (update,)),
-                "❓ Info": (self.handle_help, (update,))
-            }
-
-            if handler_info := handlers.get(text):
-                handler, args = handler_info
-                await handler(*args)
-            else:
-                await update.message.reply_text("⚠️ Unknown command")
-                
-        except Exception as e:
-            logger.error(f"Error handling message: {e}")
-            await update.message.reply_text("❌ An error occurred!")
+        if command == "stats":
+            await self.handle_stats(update, context)
+        elif command == "mailing":
+            message = ' '.join(context.args[1:])
+            await self.handle_mailing(update, context)
 
     async def start_notification_task(self):
         """Background task to check and send notifications"""
@@ -881,117 +880,40 @@ class SUIBot:
             logger.error(f"Error in invite handler: {e}")
             await update.message.reply_text("❌ An error occurred!")
 
-async def main():
-    """Initialize and start the bot"""
-    try:
-        # Initialize bot and database
-        bot = SUIBot()
-        await bot.init_db()
-        
-        # Initialize application with better error handling
-        application = (
-            Application.builder()
-            .token(bot.token)
-            .connect_timeout(30)  # Increased timeout
-            .read_timeout(30)
-            .write_timeout(30)
-            .get_updates_connect_timeout(30)
-            .get_updates_read_timeout(30)
-            .get_updates_write_timeout(30)
-            .build()
-        )
-        bot.application = application
+def main():
+    """Start the bot"""
+    # Create the Application
+    application = Application.builder().token(TOKEN).build()
 
-        # Add handlers
-        application.add_handler(CommandHandler("start", bot.start))
-        application.add_handler(CommandHandler("mailing", bot.handle_mailing))
-        application.add_handler(CommandHandler("stats", bot.handle_stats))
-        application.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            bot.handle_message
-        ))
-        application.add_handler(CommandHandler("leaders", bot.handle_ranking))
-        application.add_handler(MessageHandler(
-            filters.Regex(r"^🏆 Leaders$"), 
-            bot.handle_ranking
-        ))
-        
-        # Add error handler with retry logic
-        application.add_error_handler(error_handler)
-        
-        # Start notification task
-        bot.notification_task = asyncio.create_task(bot.start_notification_task())
-        
-        logger.info("Bot started successfully!")
-        
-        # Start polling with better error handling
-        await application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES,
-            close_loop=False,
-            pool_timeout=30,
-            read_timeout=30,
-            write_timeout=30
-        )
-        
-    except Exception as e:
-        logger.error(f"Critical error: {e}")
-        raise
+    bot = SUIBot()
+    
+    # Initialize database
+    asyncio.get_event_loop().run_until_complete(bot.init_db())
+
+    # Add handlers
+    application.add_handler(CommandHandler("start", bot.start))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
+    
+    # Admin commands
+    application.add_handler(CommandHandler("admin", bot.handle_admin_command))
+    
+    # Error handler
+    application.add_error_handler(error_handler)
+
+    # Start the bot
+    logger.info("Bot started successfully!")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
+if __name__ == '__main__':
+    main()
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors in the telegram bot with retry logic."""
-    error = context.error
-    
-    # Log the error
-    logger.error(f"Exception while handling an update: {error}")
-    
-    # Handle specific errors
-    if "Conflict: terminated by other getUpdates request" in str(error):
-        logger.info("Detected multiple instance conflict, waiting to stabilize...")
-        await asyncio.sleep(5)  # Wait for other instance to settle
-        return
-    
-    # Notify admin of other errors
-    if ADMIN_ID:
-        try:
-            await context.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=f"❌ Error in bot: {error}"
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again later!"
             )
-        except Exception as e:
-            logger.error(f"Failed to send error message to admin: {e}")
-
-if __name__ == "__main__":
-    # Configure logging
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
-    )
-    
-    # Set up signal handlers
-    for sig in (SIGINT, SIGTERM, SIGABRT):
-        signal(sig, lambda s, f: sys.exit(0))
-    
-    # Apply nest_asyncio
-    nest_asyncio.apply()
-    
-    # Run the bot with retry logic
-    retry_count = 0
-    max_retries = 3
-    
-    while retry_count < max_retries:
-        try:
-            asyncio.run(main())
-            break
-        except (KeyboardInterrupt, SystemExit):
-            logger.info("Bot stopped")
-            break
-        except Exception as e:
-            retry_count += 1
-            logger.error(f"Error (attempt {retry_count}/{max_retries}): {e}")
-            if retry_count < max_retries:
-                logger.info(f"Retrying in 5 seconds...")
-                time.sleep(5)
-            else:
-                logger.error("Max retries reached, exiting.")
-                sys.exit(1)
+    except Exception as e:
+        logger.error(f"Error in error handler: {e}")

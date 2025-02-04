@@ -17,6 +17,7 @@ from psycopg2.pool import SimpleConnectionPool
 from urllib.parse import urlparse
 from signal import signal, SIGINT, SIGTERM, SIGABRT
 import time
+import telegram
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -212,6 +213,7 @@ class SUIBot:
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         self.application = None
         self.notification_task = None
+        self.blocked_users = set()  # Cache para usuarios que bloquearon el bot
 
     async def init_db(self):
         """Initialize database and start notification task"""
@@ -220,12 +222,11 @@ class SUIBot:
         self.notification_task = asyncio.create_task(self.start_notification_task())
 
     async def start_notification_task(self):
-        """Notification task with timezone handling"""
+        """Notification task with improved error handling"""
         BATCH_SIZE = 100
         notification_cache = {}
         
         while True:
-            conn = None
             try:
                 async with self.db_pool.connection() as conn:
                     with conn.cursor(cursor_factory=DictCursor) as cur:
@@ -243,12 +244,17 @@ class SUIBot:
                         now = datetime.now(UTC)
                         
                         for row in rows:
+                            user_id = row['user_id']
+                            
+                            # Skip blocked users
+                            if user_id in self.blocked_users:
+                                continue
+                                
                             try:
-                                user_id = row['user_id']
                                 last_claim = row['last_claim'].replace(tzinfo=UTC)
                                 last_daily = row['last_daily'].replace(tzinfo=UTC)
                                 
-                                # Verificar notificaciones
+                                # Daily notification
                                 if (now - last_daily) > timedelta(days=1):
                                     cache_key = f"{user_id}_daily"
                                     if cache_key not in notification_cache or \
@@ -259,9 +265,13 @@ class SUIBot:
                                                 text="📅 Your daily bonus is ready!\nCome back to claim it!"
                                             )
                                             notification_cache[cache_key] = now
+                                        except telegram.error.Forbidden:
+                                            self.blocked_users.add(user_id)
+                                            logger.info(f"User {user_id} blocked the bot")
                                         except Exception as e:
-                                            logger.error(f"Failed to send daily notification to {user_id}: {e}")
+                                            logger.error(f"Error sending daily notification to {user_id}: {e}")
 
+                                # Claim notification
                                 if (now - last_claim) > timedelta(minutes=5):
                                     cache_key = f"{user_id}_claim"
                                     if cache_key not in notification_cache or \
@@ -272,10 +282,13 @@ class SUIBot:
                                                 text="🌟 Hey! Collect your bonus\nClaim it now!"
                                             )
                                             notification_cache[cache_key] = now
+                                        except telegram.error.Forbidden:
+                                            self.blocked_users.add(user_id)
+                                            logger.info(f"User {user_id} blocked the bot")
                                         except Exception as e:
-                                            logger.error(f"Failed to send claim notification to {user_id}: {e}")
-                                        
-                                await asyncio.sleep(0.1)
+                                            logger.error(f"Error sending claim notification to {user_id}: {e}")
+                                            
+                                await asyncio.sleep(0.05)  # Reduced sleep time
                                 
                             except Exception as e:
                                 logger.error(f"Error processing notification for {user_id}: {e}")
@@ -283,13 +296,21 @@ class SUIBot:
                             
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
-            finally:
-                # Limpiar cache antigua
+            
+            # Clean old cache entries
+            try:
                 current_time = datetime.now(UTC)
                 notification_cache = {k: v for k, v in notification_cache.items() 
                                    if (current_time - v) < timedelta(days=1)}
                 
-                await asyncio.sleep(30)
+                # Clean blocked users cache periodically
+                if len(self.blocked_users) > 1000:  # Prevent memory growth
+                    self.blocked_users.clear()
+                    
+            except Exception as e:
+                logger.error(f"Error cleaning cache: {e}")
+            
+            await asyncio.sleep(30)  # Reduced sleep time
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from database"""

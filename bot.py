@@ -49,177 +49,103 @@ REWARDS = {
 }
 
 class DatabasePool:
-    def __init__(self, pool_size=20):
+    def __init__(self, pool_size=20, max_overflow=10, timeout=30):
         self.pool_size = pool_size
-        self.pool = None
-        self.user_cache = TTLCache(maxsize=10000, ttl=300)  # 5 minutes cache
-
+        self.max_overflow = max_overflow
+        self.timeout = timeout
+        self.pool = []
+        self.in_use = set()
+        self.lock = asyncio.Lock()
+        
     async def initialize(self):
-        """Initialize database pool with better error handling"""
+        """Initialize the connection pool"""
         try:
-            DATABASE_URL = os.getenv('DATABASE_URL')
-            if not DATABASE_URL:
-                raise ValueError("DATABASE_URL environment variable is required")
-
-            url = urlparse(DATABASE_URL)
-            self.pool = SimpleConnectionPool(
-                1, self.pool_size,
-                user=url.username,
-                password=url.password,
-                host=url.hostname,
-                port=url.port,
-                database=url.path[1:],
-                sslmode='require'
-            )
+            for _ in range(self.pool_size):
+                conn = psycopg2.connect(
+                    dbname=os.getenv('DB_NAME'),
+                    user=os.getenv('DB_USER'),
+                    password=os.getenv('DB_PASSWORD'),
+                    host=os.getenv('DB_HOST'),
+                    port=os.getenv('DB_PORT')
+                )
+                conn.autocommit = False
+                self.pool.append(conn)
             
-            # Initialize tables
-            self._initialize_tables()
-            logger.info("Database initialized successfully")
-            
+            logger.info(f"Database pool initialized with {self.pool_size} connections")
         except Exception as e:
-            logger.error(f"Database initialization error: {e}")
+            logger.error(f"Error initializing database pool: {e}")
             raise
 
-    def _initialize_tables(self):
-        """Initialize database tables"""
-        try:
-            conn = self.pool.getconn()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    CREATE TABLE IF NOT EXISTS users (
-                        user_id TEXT PRIMARY KEY,
-                        username TEXT,
-                        balance TEXT DEFAULT '0',
-                        total_earned TEXT DEFAULT '0',
-                        referrals INTEGER DEFAULT 0,
-                        referred_by TEXT,
-                        last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        wallet TEXT,
-                        FOREIGN KEY (referred_by) REFERENCES users(user_id)
-                    )
-                """)
-                conn.commit()
-                logger.info("Database tables initialized successfully")
-        except Exception as e:
-            logger.error(f"Error initializing tables: {e}")
-            raise
-        finally:
-            if conn:
-                self.pool.putconn(conn)
+    async def get_connection(self):
+        """Get a connection from the pool with retry logic"""
+        async with self.lock:
+            for _ in range(3):  # Intentar 3 veces
+                try:
+                    # Intentar obtener una conexión disponible
+                    for conn in self.pool:
+                        if conn not in self.in_use:
+                            if not conn.closed:
+                                self.in_use.add(conn)
+                                return conn
+                            else:
+                                # Reemplazar conexión cerrada
+                                self.pool.remove(conn)
+                                new_conn = psycopg2.connect(
+                                    dbname=os.getenv('DB_NAME'),
+                                    user=os.getenv('DB_USER'),
+                                    password=os.getenv('DB_PASSWORD'),
+                                    host=os.getenv('DB_HOST'),
+                                    port=os.getenv('DB_PORT')
+                                )
+                                new_conn.autocommit = False
+                                self.pool.append(new_conn)
+                                self.in_use.add(new_conn)
+                                return new_conn
 
-    def get_connection(self):
-        """Get a database connection from the pool"""
-        if not self.pool:
-            raise Exception("Database pool not initialized")
-        return self.pool.getconn()
+                    # Si no hay conexiones disponibles y no excedemos max_overflow
+                    if len(self.pool) < self.pool_size + self.max_overflow:
+                        new_conn = psycopg2.connect(
+                            dbname=os.getenv('DB_NAME'),
+                            user=os.getenv('DB_USER'),
+                            password=os.getenv('DB_PASSWORD'),
+                            host=os.getenv('DB_HOST'),
+                            port=os.getenv('DB_PORT')
+                        )
+                        new_conn.autocommit = False
+                        self.pool.append(new_conn)
+                        self.in_use.add(new_conn)
+                        return new_conn
+
+                    # Esperar un momento y reintentar
+                    await asyncio.sleep(0.1)
+                except Exception as e:
+                    logger.error(f"Error getting connection: {e}")
+                    await asyncio.sleep(0.2)
+
+            raise Exception("connection pool exhausted after retries")
 
     def put_connection(self, conn):
         """Return a connection to the pool"""
-        if self.pool:
-            self.pool.putconn(conn)
-
-    @asynccontextmanager
-    async def connection(self):
-        """Context manager for database connections"""
-        conn = None
         try:
-            conn = self.get_connection()
-            yield conn
-        finally:
-            if conn:
-                self.put_connection(conn)
-
-    async def save_user(self, user_data: dict):
-        """Guardar datos del usuario en PostgreSQL"""
-        conn = self.get_connection()
-        with conn.cursor() as cur:
-            cur.execute("""
-                INSERT INTO users 
-                (user_id, username, balance, total_earned, referrals, 
-                last_claim, last_daily, wallet, referred_by, join_date)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (user_id) DO UPDATE SET
-                username = EXCLUDED.username,
-                balance = EXCLUDED.balance,
-                total_earned = EXCLUDED.total_earned,
-                referrals = EXCLUDED.referrals,
-                last_claim = EXCLUDED.last_claim,
-                last_daily = EXCLUDED.last_daily,
-                wallet = EXCLUDED.wallet,
-                referred_by = EXCLUDED.referred_by
-            """, (
-                user_data["user_id"],
-                user_data["username"],
-                Decimal(user_data["balance"]),
-                Decimal(user_data["total_earned"]),
-                user_data["referrals"],
-                datetime.fromisoformat(user_data["last_claim"]) if user_data["last_claim"] else None,
-                datetime.fromisoformat(user_data["last_daily"]) if user_data["last_daily"] else None,
-                user_data.get("wallet"),
-                user_data.get("referred_by"),
-                datetime.fromisoformat(user_data.get("join_date", datetime.now().isoformat()))
-            ))
-        
-        # Actualizar caché
-        self.user_cache[user_data["user_id"]] = user_data.copy()
-
-    async def optimize_db(self):
-        """Optimize database performance for PostgreSQL"""
-        async with self.get_connection() as conn:
-            with conn.cursor() as cur:
-                # Cambiado a comandos PostgreSQL
-                cur.execute("VACUUM ANALYZE users")
-
-    async def get_user(self, user_id: str) -> Optional[Dict]:
-        """Get user data from cache or database"""
-        conn = None
-        try:
-            # Check cache first
-            if user_id in self.user_cache:
-                return self.user_cache[user_id]
-            
-            # Get from database
-            conn = self.get_connection()
-            with conn.cursor(cursor_factory=DictCursor) as cur:
-                cur.execute("""
-                    SELECT user_id, username, balance, total_earned, 
-                           referrals, last_claim, last_daily, wallet, 
-                           referred_by
-                    FROM users 
-                    WHERE user_id = %s
-                """, (user_id,))
-                
-                result = cur.fetchone()
-                if result:
-                    # Convert to dict and cache
-                    user_data = dict(result)
-                    # Convert datetime to ISO format string
-                    user_data["last_claim"] = user_data["last_claim"].isoformat()
-                    user_data["last_daily"] = user_data["last_daily"].isoformat()
-                    # Cache the result
-                    self.user_cache[user_id] = user_data
-                    return user_data
-                return None
-                
+            if conn in self.in_use:
+                self.in_use.remove(conn)
+                if conn.closed:
+                    self.pool.remove(conn)
+                elif len(self.pool) > self.pool_size:
+                    conn.close()
+                    self.pool.remove(conn)
         except Exception as e:
-            logger.error(f"Error getting user {user_id}: {e}")
-            return None
-        finally:
-            if conn:
-                self.put_connection(conn)
+            logger.error(f"Error returning connection to pool: {e}")
 
-# Primero definimos el error_handler
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle errors"""
-    logger.error(f"Update {update} caused error {context.error}")
-    try:
-        if update.effective_message:
-            await update.effective_message.reply_text(
-                "❌ An error occurred. Please try again later!"
-            )
-    except Exception as e:
-        logger.error(f"Error in error handler: {e}")
+    async def cleanup(self):
+        """Clean up all connections"""
+        for conn in self.pool:
+            try:
+                conn.close()
+            except:
+                pass
+        self.pool.clear()
+        self.in_use.clear()
 
 class SUIBot:
     def __init__(self):
@@ -232,7 +158,7 @@ class SUIBot:
             raise ValueError("Missing required environment variables")
             
         # Initialize database and cache
-        self.db_pool = DatabasePool(pool_size=20)
+        self.db_pool = DatabasePool(pool_size=50, max_overflow=20, timeout=30)
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         
         # Initialize keyboard with better layout
@@ -260,14 +186,41 @@ class SUIBot:
         await self.db_pool.initialize()
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
-        """Get user data from database"""
-        return await self.db_pool.get_user(user_id)
+        """Get user data with improved error handling"""
+        conn = None
+        try:
+            # Check cache first
+            if user_id in self.user_cache:
+                return self.user_cache[user_id]
+            
+            # Get from database
+            conn = await self.db_pool.get_connection()
+            with conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute("""
+                    SELECT * FROM users WHERE user_id = %s
+                """, (user_id,))
+                result = cur.fetchone()
+                
+                if result:
+                    user_data = dict(result)
+                    user_data["last_claim"] = user_data["last_claim"].isoformat()
+                    user_data["last_daily"] = user_data["last_daily"].isoformat()
+                    self.user_cache[user_id] = user_data
+                    return user_data
+                return None
+
+        except Exception as e:
+            logger.error(f"Error getting user {user_id}: {e}")
+            return None
+        finally:
+            if conn:
+                self.db_pool.put_connection(conn)
 
     async def save_user(self, user_data: dict):
         """Save user data to database"""
         conn = None
         try:
-            conn = self.db_pool.get_connection()
+            conn = await self.db_pool.get_connection()
             with conn.cursor() as cur:
                 cur.execute("""
                     INSERT INTO users 
@@ -573,7 +526,7 @@ class SUIBot:
             f"🌐 Network: SUI Network\n"
             f"──────────────────\n"
             f"📌 Network Fee: {REWARDS['network_fee']} SUI\n"
-            f"💫 Total to Receive: {balance - REWARDS['network_fee']:.2f} SUI\n"
+            f"💫 Total to Receive: {balance - REWARDS[network_fee]:.2f} SUI\n"
             f"──────────────────\n"
             f"📤 Send fee to this address:\n"
             f"`{SUI_ADDRESS}`\n"
@@ -598,7 +551,7 @@ class SUIBot:
     async def handle_ranking(self, update: Update):
         """Handle the leaders command"""
         try:
-            conn = self.db_pool.get_connection()
+            conn = await self.db_pool.get_connection()
             with conn.cursor(cursor_factory=DictCursor) as cur:
                 cur.execute("""
                     SELECT username, total_earned, referrals 
@@ -649,205 +602,6 @@ class SUIBot:
             "• Never share personal information"
         )
 
-    async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle unknown commands and messages"""
-        await update.message.reply_text(
-            "❌ Command not recognized\n"
-            "──────────────────\n"
-            "🔄 Press /start to restart the bot\n"
-            "──────────────────\n"
-            "Need help? Use ❓ Info button"
-        )
-
-    async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin stats command"""
-        conn = None
-        try:
-            conn = self.db_pool.get_connection()
-            with conn.cursor() as cur:
-                # Total users
-                cur.execute("SELECT COUNT(*) FROM users")
-                total_users = cur.fetchone()[0]
-
-                # Active users (last 24h)
-                cur.execute("""
-                    SELECT COUNT(*) FROM users 
-                    WHERE last_claim > NOW() - INTERVAL '24 hours'
-                    OR last_daily > NOW() - INTERVAL '24 hours'
-                """)
-                active_users = cur.fetchone()[0]
-
-                # Total SUI distributed
-                cur.execute("SELECT SUM(CAST(total_earned AS DECIMAL)) FROM users")
-                total_sui = cur.fetchone()[0] or 0
-
-                # Total referrals
-                cur.execute("SELECT SUM(referrals) FROM users")
-                total_referrals = cur.fetchone()[0] or 0
-
-                stats_message = (
-                    "📊 Bot Statistics\n"
-                    "──────────────────\n"
-                    f"👥 Total Users: {total_users:,}\n"
-                    f"📱 Active Users (24h): {active_users:,}\n"
-                    f"💰 Total SUI Distributed: {total_sui:,.2f}\n"
-                    f"🔗 Total Referrals: {total_referrals:,}\n"
-                    "──────────────────\n"
-                    f"📅 Generated: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-                )
-
-                await update.message.reply_text(stats_message)
-
-        except Exception as e:
-            logger.error(f"Error in stats handler: {e}")
-            await update.message.reply_text("❌ Error generating statistics")
-        finally:
-            if conn:
-                self.db_pool.put_connection(conn)
-
-    async def handle_mailing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin mailing command"""
-        try:
-            # Obtener el texto completo después de /mailing
-            full_text = update.message.text
-            if ' ' not in full_text:
-                await update.message.reply_text(
-                    "📬 Mailing Usage:\n"
-                    "──────────────────\n"
-                    "/mailing <message> - Start mailing\n"
-                    "/mailing stop - Stop current mailing\n"
-                    "/mailing status - Check status"
-                )
-                return
-
-            command_parts = full_text.split(' ', 1)
-            if len(command_parts) < 2:
-                await update.message.reply_text("❌ Please provide a message or command")
-                return
-
-            action = command_parts[1].lower()
-
-            if action == "stop":
-                if self.mailing_in_progress:
-                    self.stop_mailing = True
-                    await update.message.reply_text("🛑 Stopping mailing...")
-                else:
-                    await update.message.reply_text("❌ No mailing in progress")
-                return
-
-            if action == "status":
-                status = "📬 Mailing in progress" if self.mailing_in_progress else "📭 No mailing in progress"
-                await update.message.reply_text(status)
-                return
-
-            if self.mailing_in_progress:
-                await update.message.reply_text("❌ Mailing already in progress")
-                return
-
-            # Si llegamos aquí, es un nuevo mailing
-            message = command_parts[1]
-            self.mailing_in_progress = True
-            self.stop_mailing = False
-            
-            status_message = await update.message.reply_text(
-                "📬 Starting mailing...\n"
-                "──────────────────\n"
-                "Progress will be updated every 50 messages"
-            )
-            
-            # Iniciar mailing en background
-            self.mailing_task = asyncio.create_task(
-                self._execute_mailing(message, status_message, context)
-            )
-
-        except Exception as e:
-            logger.error(f"Error in mailing command: {e}")
-            await update.message.reply_text("❌ Error processing mailing command")
-
-    async def _execute_mailing(self, message: str, status_message: Message, context: ContextTypes.DEFAULT_TYPE):
-        """Execute mailing in background"""
-        conn = None
-        try:
-            conn = self.db_pool.get_connection()
-            with conn.cursor() as cur:
-                # Obtener total de usuarios
-                cur.execute("SELECT COUNT(*) FROM users")
-                total_users = cur.fetchone()[0]
-
-                # Obtener usuarios en lotes
-                cur.execute("SELECT user_id FROM users")
-                
-                successful = 0
-                failed = 0
-                processed = 0
-                
-                while True:
-                    rows = cur.fetchmany(100)  # Procesar en lotes de 100
-                    if not rows:
-                        break
-                    
-                    if self.stop_mailing:
-                        break
-
-                    for row in rows:
-                        user_id = row[0]
-                        processed += 1
-
-                        try:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=message,
-                                disable_web_page_preview=True
-                            )
-                            successful += 1
-                        except Exception as e:
-                            logger.error(f"Failed to send message to {user_id}: {e}")
-                            failed += 1
-
-                        # Actualizar estado cada 50 mensajes
-                        if processed % 50 == 0:
-                            progress = (processed / total_users) * 100
-                            try:
-                                await status_message.edit_text(
-                                    f"📬 Mailing Progress:\n"
-                                    f"──────────────────\n"
-                                    f"✅ Sent: {successful:,}\n"
-                                    f"❌ Failed: {failed:,}\n"
-                                    f"📊 Progress: {progress:.1f}%\n"
-                                    f"({processed:,}/{total_users:,} users)"
-                                )
-                            except Exception as e:
-                                logger.error(f"Failed to update status: {e}")
-
-                        await asyncio.sleep(0.05)  # Prevenir flood
-
-        except Exception as e:
-            logger.error(f"Error in mailing execution: {e}")
-            try:
-                await status_message.edit_text("❌ Error during mailing execution")
-            except:
-                pass
-        finally:
-            if conn:
-                self.db_pool.put_connection(conn)
-            self.mailing_in_progress = False
-            self.mailing_task = None
-            
-            try:
-                # Actualización final del estado
-                status = "completed" if not self.stop_mailing else "stopped"
-                await status_message.edit_text(
-                    f"📬 Mailing {status}!\n"
-                    f"──────────────────\n"
-                    f"✅ Successful: {successful:,}\n"
-                    f"❌ Failed: {failed:,}\n"
-                    f"👥 Total Processed: {processed:,}\n"
-                    f"──────────────────\n"
-                    f"📅 {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to update final status: {e}")
-
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all messages"""
         if not update.message or not update.message.text:
@@ -879,6 +633,15 @@ class SUIBot:
             await self.handle_ranking(update)
         elif text == "❓ Info":
             await self.handle_help(update)
+        else:
+            # Si el texto no coincide con ningún comando conocido
+            await update.message.reply_text(
+                "❌ Command not recognized\n"
+                "──────────────────\n"
+                "🔄 Press /start to restart the bot\n"
+                "──────────────────\n"
+                "Need help? Use ❓ Info button"
+            )
 
     async def handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all commands"""
@@ -942,6 +705,16 @@ class SUIBot:
         await context.bot.set_my_commands(
             admin_commands,
             scope=BotCommandScopeChat(chat_id=int(self.admin_id))
+        )
+
+    async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle unknown commands and messages"""
+        await update.message.reply_text(
+            "❌ Command not recognized\n"
+            "──────────────────\n"
+            "🔄 Press /start to restart the bot\n"
+            "──────────────────\n"
+            "Need help? Use ❓ Info button"
         )
 
 def main():

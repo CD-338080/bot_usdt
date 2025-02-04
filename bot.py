@@ -196,7 +196,6 @@ class DatabasePool:
 
 class SUIBot:
     def __init__(self):
-        # Validate required environment variables
         self.token = os.getenv('BOT_TOKEN')
         if not self.token:
             raise ValueError("BOT_TOKEN environment variable is required")
@@ -205,28 +204,28 @@ class SUIBot:
         if not self.admin_id:
             raise ValueError("ADMIN_ID environment variable is required")
         
-        # Initialize database pool with larger size
+        # Initialize database pool
         self.db_pool = DatabasePool(pool_size=20)
         
-        # Enhanced cache configurations
-        self.user_cache = TTLCache(maxsize=100000, ttl=600)
-        self.balance_cache = LRUCache(maxsize=100000)
-        
-        # Prepare keyboard markup once
-        self._keyboard = self._create_keyboard()
-
-    def _create_keyboard(self):
-        keyboard = [
-            [{"text": "🌟 Collect", "resize_keyboard": True}],  # Botón grande individual
-            ["📅 Daily Reward", "📊 My Stats"],
-            ["👨‍👦‍👦 Invite", "💸 Cash Out"],
-            ["🔑 SUI Address", "🏆 Leaders", "❓ Info"]
-        ]
-        return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
+        # Initialize keyboard markup
+        self._keyboard = ReplyKeyboardMarkup([
+            ["🌟 Collect", "📅 Daily Reward"],
+            ["📊 My Stats", "👨‍👦‍👦 Invite"],
+            ["💸 Cash Out", "🔑 SUI Address"],
+            ["🏆 Leaders", "❓ Info"]
+        ], resize_keyboard=True)
 
     async def init_db(self):
-        """Initialize database with optimized schema"""
+        """Initialize database connection"""
         await self.db_pool.initialize()
+
+    async def get_user(self, user_id: str) -> Optional[Dict]:
+        """Get user data from database"""
+        return await self.db_pool.get_user(user_id)
+
+    async def save_user(self, user_data: dict):
+        """Save user data to database"""
+        await self.db_pool.save_user(user_data)
 
     async def _notify_referrer(self, bot, referrer_id):
         """Separate notification function for better performance"""
@@ -642,39 +641,31 @@ class SUIBot:
 
     async def start_notification_task(self):
         """Background task to check and send notifications"""
-        BATCH_SIZE = 1000
         while True:
             try:
-                conn = self.get_connection()
+                conn = self.db_pool.get_connection()
                 with conn.cursor(cursor_factory=DictCursor) as cur:
-                    cur.execute("SELECT COUNT(*) as count FROM users")
-                    result = cur.fetchone()
-                    total_users = result['count']
+                    cur.execute("""
+                        SELECT user_id, last_claim, last_daily 
+                        FROM users 
+                        WHERE last_claim < NOW() - INTERVAL '1 hour'
+                        OR last_daily < NOW() - INTERVAL '1 day'
+                        LIMIT 1000
+                    """)
+                    rows = cur.fetchall()
                     
-                    for offset in range(0, total_users, BATCH_SIZE):
-                        cur.execute("""
-                            SELECT user_id, last_claim, last_daily 
-                            FROM users 
-                            LIMIT %s OFFSET %s
-                        """, (BATCH_SIZE, offset))
-                        
-                        rows = cur.fetchall()
-                        for row in rows:
-                            user_data = dict(row)
-                            user_id = user_data["user_id"]
-                            
-                            try:
-                                await self._process_notifications(user_id, user_data)
-                            except Exception as e:
-                                logger.error(f"Error processing notification for {user_id}: {e}")
-                            await asyncio.sleep(0.05)
-                        
-                        await asyncio.sleep(1)
-                        
+                    for row in rows:
+                        user_data = dict(row)
+                        try:
+                            await self._process_notifications(user_data["user_id"], user_data)
+                        except Exception as e:
+                            logger.error(f"Error processing notification: {e}")
+                        await asyncio.sleep(0.05)
+                    
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
             finally:
-                await asyncio.sleep(300)  # 5 minutes delay between checks
+                await asyncio.sleep(300)
 
     async def _process_notifications(self, user_id: str, user_data: dict):
         """Process notifications for a single user"""
@@ -698,21 +689,12 @@ class SUIBot:
             logger.error(f"Failed to process notifications for {user_id}: {e}")
 
 async def main():
-    """Initialize and start the bot with proper error handling"""
-    logging.basicConfig(
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-        level=logging.INFO
-    )
-    logger = logging.getLogger(__name__)
-
+    """Initialize and start the bot"""
     bot = None
     try:
-        # Initialize bot
+        # Initialize bot and database
         bot = SUIBot()
-        
-        # Initialize database
         await bot.init_db()
-        logger.info("Database initialized successfully")
         
         # Initialize application
         application = Application.builder().token(bot.token).build()
@@ -726,26 +708,21 @@ async def main():
             filters.TEXT & ~filters.COMMAND,
             bot.handle_message
         ))
-
-        # Add error handler
         application.add_error_handler(error_handler)
         
         # Start notification task
-        asyncio.create_task(bot.start_notification_task())
+        notification_task = asyncio.create_task(bot.start_notification_task())
         
         logger.info("Bot started successfully!")
         
         # Start polling
-        await application.run_polling(
-            drop_pending_updates=True,
-            allowed_updates=Update.ALL_TYPES
-        )
+        await application.run_polling(drop_pending_updates=True)
         
     except Exception as e:
-        logger.error(f"Critical error starting bot: {str(e)}")
+        logger.error(f"Critical error: {e}")
         if bot and hasattr(bot, 'db_pool'):
             await bot.db_pool.close()
-        sys.exit(1)
+        raise
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors in the telegram bot."""

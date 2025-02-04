@@ -207,31 +207,87 @@ class DatabasePool:
 
 class SUIBot:
     def __init__(self):
-        # Validate environment variables
-        self.token = os.getenv('BOT_TOKEN')
-        self.admin_id = os.getenv('ADMIN_ID')
-        self.sui_address = os.getenv('SUI_ADDRESS')
-        
-        if not all([self.token, self.admin_id, self.sui_address]):
-            raise ValueError("Missing required environment variables")
-            
-        # Initialize database and cache
         self.db_pool = DatabasePool(pool_size=20)
+        self.admin_id = ADMIN_ID
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
-        
-        # Initialize keyboard with better layout
-        self._keyboard = ReplyKeyboardMarkup([
-            ["🌟 Collect", "📅 Daily Reward"],
-            ["📊 My Stats", "👨‍👦‍👦 Invite"],
-            ["💸 Cash Out", "🔑 SUI Address"],
-            ["🏆 Leaders", "❓ Info"]
-        ], resize_keyboard=True)
-        
+        self.application = None
         self.notification_task = None
 
     async def init_db(self):
-        """Initialize database connection"""
+        """Initialize database and start notification task"""
         await self.db_pool.initialize()
+        # Iniciar tarea de notificaciones
+        self.notification_task = asyncio.create_task(self.start_notification_task())
+
+    async def start_notification_task(self):
+        """Notification task with improved connection handling"""
+        BATCH_SIZE = 100  # Reducido para mejor manejo
+        notification_cache = {}
+        
+        while True:
+            conn = None
+            try:
+                async with self.db_pool.connection() as conn:
+                    with conn.cursor(cursor_factory=DictCursor) as cur:
+                        cur.execute("""
+                            SELECT user_id, last_claim, last_daily
+                            FROM users 
+                            WHERE last_claim < NOW() - INTERVAL '5 minutes'
+                            OR last_daily < NOW() - INTERVAL '24 hours'
+                            LIMIT %s
+                        """, (BATCH_SIZE,))
+                        rows = cur.fetchall()
+                        
+                        now = datetime.now(UTC)
+                        
+                        for row in rows:
+                            try:
+                                user_id = row['user_id']
+                                last_claim = row['last_claim']
+                                last_daily = row['last_daily']
+                                
+                                # Verificar notificaciones
+                                if now - last_daily > timedelta(days=1):
+                                    cache_key = f"{user_id}_daily"
+                                    if cache_key not in notification_cache or \
+                                       now - notification_cache[cache_key] > timedelta(hours=23):
+                                        try:
+                                            await self.application.bot.send_message(
+                                                chat_id=user_id,
+                                                text="📅 Your daily bonus is ready!\nCome back to claim it!"
+                                            )
+                                            notification_cache[cache_key] = now
+                                        except Exception as e:
+                                            logger.error(f"Failed to send daily notification to {user_id}: {e}")
+
+                                if now - last_claim > timedelta(minutes=5):
+                                    cache_key = f"{user_id}_claim"
+                                    if cache_key not in notification_cache or \
+                                       now - notification_cache[cache_key] > timedelta(minutes=4):
+                                        try:
+                                            await self.application.bot.send_message(
+                                                chat_id=user_id,
+                                                text="🌟 Hey! Collect your bonus\nClaim it now!"
+                                            )
+                                            notification_cache[cache_key] = now
+                                        except Exception as e:
+                                            logger.error(f"Failed to send claim notification to {user_id}: {e}")
+                                            
+                                await asyncio.sleep(0.1)  # Prevenir flood
+                                
+                            except Exception as e:
+                                logger.error(f"Error processing notification for {user_id}: {e}")
+                                continue
+                            
+            except Exception as e:
+                logger.error(f"Error in notification task: {e}")
+            finally:
+                # Limpiar cache antigua
+                current_time = datetime.now(UTC)
+                notification_cache = {k: v for k, v in notification_cache.items() 
+                                   if current_time - v < timedelta(days=1)}
+                
+                await asyncio.sleep(30)  # Reducido el tiempo de espera
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from database"""
@@ -772,113 +828,7 @@ class SUIBot:
             message = ' '.join(context.args[1:])
             await self.handle_mailing(update, context)
 
-    async def start_notification_task(self):
-        """Background task to check and send notifications"""
-        BATCH_SIZE = 1000
-        # Cache para rastrear las últimas notificaciones enviadas
-        notification_cache = {}
-        
-        while True:
-            try:
-                conn = self.db_pool.get_connection()
-                with conn.cursor(cursor_factory=DictCursor) as cur:
-                    cur.execute("""
-                        SELECT user_id, 
-                               last_claim,
-                               last_daily
-                        FROM users 
-                        WHERE last_claim < NOW() - INTERVAL '5 minutes'
-                        OR last_daily < NOW() - INTERVAL '24 hours'
-                        LIMIT %s
-                    """, (BATCH_SIZE,))
-                    rows = cur.fetchall()
-                    
-                    now = datetime.now(UTC).replace(tzinfo=None)
-                    
-                    for row in rows:
-                        try:
-                            user_id = row['user_id']
-                            last_claim = row['last_claim']
-                            last_daily = row['last_daily']
-                            
-                            if isinstance(last_claim, datetime):
-                                last_claim = last_claim.replace(tzinfo=None)
-                            else:
-                                continue
-                            
-                            if isinstance(last_daily, datetime):
-                                last_daily = last_daily.replace(tzinfo=None)
-                            else:
-                                continue
-
-                            # Verificar daily bonus
-                            if now - last_daily > timedelta(days=1):
-                                cache_key = f"{user_id}_daily"
-                                if cache_key not in notification_cache or \
-                                   now - notification_cache[cache_key] > timedelta(hours=23):
-                                    await self.application.bot.send_message(
-                                        chat_id=user_id,
-                                        text="📅 Your daily bonus is ready!\nCome back to claim it!"
-                                    )
-                                    notification_cache[cache_key] = now
-                            
-                            # Verificar claim bonus
-                            if now - last_claim > timedelta(minutes=5):
-                                cache_key = f"{user_id}_claim"
-                                if cache_key not in notification_cache or \
-                                   now - notification_cache[cache_key] > timedelta(minutes=4):
-                                    await self.application.bot.send_message(
-                                        chat_id=user_id,
-                                        text="🌟 Hey! Collect your bonus\nClaim it now!"
-                                    )
-                                    notification_cache[cache_key] = now
-                                
-                        except Exception as e:
-                            logger.error(f"Error processing notification for {user_id}: {e}")
-                        await asyncio.sleep(0.05)
-                        
-            except Exception as e:
-                logger.error(f"Error in notification task: {e}")
-            finally:
-                if conn:
-                    self.db_pool.put_connection(conn)
-                await asyncio.sleep(60)
-                
-                # Limpiar cache antigua
-                current_time = datetime.now(UTC).replace(tzinfo=None)
-                notification_cache = {k: v for k, v in notification_cache.items() 
-                                   if current_time - v < timedelta(days=1)}
-
-    async def handle_invite(self, update: Update):
-        """Handle invite command"""
-        if not update.message:
-            return
-        
-        user_id = str(update.effective_user.id)
-        bot_username = (await update.get_bot()).username
-        
-        try:
-            user_data = await self.get_user(user_id)
-            if not user_data:
-                await update.message.reply_text("⚠️ Please start the bot first with /start")
-                return
-
-            referral_link = f"https://t.me/{bot_username}?start={user_id}"
-            referrals = user_data.get("referrals", 0)
-            earned = Decimal(user_data.get("total_earned", "0"))
-            
-            await update.message.reply_text(
-                f"🤝 Share your referral link:\n"
-                f"{referral_link}\n\n"
-                f"👥 Your referrals: {referrals}\n"
-                f"💰 Earned from referrals: {earned} SUI\n\n"
-                f"💎 Earn {REWARDS['referral']} SUI for each referral!"
-            )
-        except Exception as e:
-            logger.error(f"Error in invite handler: {e}")
-            await update.message.reply_text("❌ An error occurred!")
-
-async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle errors"""
     logger.error(f"Update {update} caused error {context.error}")
     try:
@@ -890,26 +840,31 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to send error message to admin: {e}")
 
 def main():
-    """Start the bot"""
-    # Create the Application
+    """Start the bot with improved error handling"""
     application = Application.builder().token(TOKEN).build()
-
     bot = SUIBot()
+    bot.application = application
     
-    # Initialize database
+    # Initialize database and start notification task
     asyncio.get_event_loop().run_until_complete(bot.init_db())
 
     # Add handlers
     application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
-    # Admin commands
     application.add_handler(CommandHandler("admin", bot.handle_admin_command))
-    
-    # Error handler
     application.add_error_handler(error_handler)
 
-    # Start the bot
+    # Graceful shutdown handler
+    def shutdown(signum, frame):
+        logger.info("Shutting down bot...")
+        if bot.notification_task:
+            bot.notification_task.cancel()
+        sys.exit(0)
+
+    signal(SIGINT, shutdown)
+    signal(SIGTERM, shutdown)
+    signal(SIGABRT, shutdown)
+
     logger.info("Bot started successfully!")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 

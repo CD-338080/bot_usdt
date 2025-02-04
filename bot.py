@@ -47,67 +47,66 @@ REWARDS = {
 }
 
 class DatabasePool:
-    def __init__(self, pool_size: int = 20):
+    def __init__(self, pool_size=20):
         self.pool_size = pool_size
-        self.conn = None
-        self._lock = asyncio.Lock()
-        self._initialized = False
-        
-        # Get database URL from environment
-        self.db_url = os.getenv('DATABASE_URL')
-        if not self.db_url:
-            raise ValueError("DATABASE_URL environment variable is required")
-        
-        # Parse DATABASE_URL
-        url = urlparse(self.db_url)
-        self.db_params = {
-            'dbname': url.path[1:],
-            'user': url.username,
-            'password': url.password,
-            'host': url.hostname,
-            'port': url.port
-        }
-        
-        # Initialize user cache
-        self.user_cache = TTLCache(maxsize=100000, ttl=600)
+        self.pool = None
+        self.user_cache = TTLCache(maxsize=10000, ttl=300)  # 5 minutes cache
+
+    async def initialize(self):
+        """Initialize database pool with better error handling"""
+        try:
+            DATABASE_URL = os.getenv('DATABASE_URL')
+            if not DATABASE_URL:
+                raise ValueError("DATABASE_URL environment variable is required")
+
+            url = urlparse(DATABASE_URL)
+            self.pool = psycopg2.pool.SimpleConnectionPool(
+                1, self.pool_size,
+                user=url.username,
+                password=url.password,
+                host=url.hostname,
+                port=url.port,
+                database=url.path[1:],
+                sslmode='require'
+            )
+            
+            # Initialize tables
+            self._initialize_tables()
+            logger.info("Database initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Database initialization error: {e}")
+            raise
+
+    def _initialize_tables(self):
+        """Initialize database tables with better structure"""
+        with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id TEXT PRIMARY KEY,
+                        username TEXT,
+                        balance NUMERIC(20,8) DEFAULT 0,
+                        total_earned NUMERIC(20,8) DEFAULT 0,
+                        referrals INTEGER DEFAULT 0,
+                        last_claim TIMESTAMP DEFAULT NOW(),
+                        last_daily TIMESTAMP DEFAULT NOW(),
+                        wallet TEXT,
+                        referred_by TEXT,
+                        join_date TIMESTAMP DEFAULT NOW(),
+                        FOREIGN KEY (referred_by) REFERENCES users(user_id)
+                    )
+                """)
+                conn.commit()
+                logger.info("Database tables initialized successfully")
 
     def get_connection(self):
         """Get a database connection"""
-        if not self.conn or self.conn.closed:
-            self.conn = psycopg2.connect(**self.db_params)
-            self.conn.autocommit = True
-        return self.conn
-
-    async def initialize(self):
-        """Initialize database connection"""
-        if not self._initialized:
-            try:
-                self.conn = self.get_connection()
-                with self.conn.cursor() as cur:
-                    cur.execute("""
-                        CREATE TABLE IF NOT EXISTS users (
-                            user_id VARCHAR(32) PRIMARY KEY,
-                            username VARCHAR(64),
-                            balance NUMERIC(20,8) DEFAULT 0,
-                            total_earned NUMERIC(20,8) DEFAULT 0,
-                            referrals INT DEFAULT 0,
-                            last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                            wallet VARCHAR(42),
-                            referred_by VARCHAR(32),
-                            join_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                        )
-                    """)
-                self._initialized = True
-                logger.info("Database tables initialized successfully")
-            except Exception as e:
-                logger.error(f"Database initialization failed: {str(e)}")
-                raise
+        return self.pool.getconn()
 
     async def close(self):
         """Close database connection"""
-        if self.conn:
-            self.conn.close()
+        await self.pool.close()
 
     @asynccontextmanager
     async def connection(self):
@@ -156,9 +155,10 @@ class DatabasePool:
 
     async def optimize_db(self):
         """Optimize database performance for PostgreSQL"""
-        async with self.conn.cursor() as cur:
-            # Cambiado a comandos PostgreSQL
-            cur.execute("VACUUM ANALYZE users")
+        async with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Cambiado a comandos PostgreSQL
+                cur.execute("VACUUM ANALYZE users")
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from cache or database"""
@@ -197,18 +197,19 @@ class DatabasePool:
 
 class SUIBot:
     def __init__(self):
+        # Validate environment variables
         self.token = os.getenv('BOT_TOKEN')
-        if not self.token:
-            raise ValueError("BOT_TOKEN environment variable is required")
-            
         self.admin_id = os.getenv('ADMIN_ID')
-        if not self.admin_id:
-            raise ValueError("ADMIN_ID environment variable is required")
+        self.sui_address = os.getenv('SUI_ADDRESS')
         
-        # Initialize database pool
+        if not all([self.token, self.admin_id, self.sui_address]):
+            raise ValueError("Missing required environment variables")
+            
+        # Initialize database and cache
         self.db_pool = DatabasePool(pool_size=20)
+        self.user_cache = TTLCache(maxsize=10000, ttl=300)
         
-        # Initialize keyboard markup
+        # Initialize keyboard with better layout
         self._keyboard = ReplyKeyboardMarkup([
             ["🌟 Collect", "📅 Daily Reward"],
             ["📊 My Stats", "👨‍👦‍👦 Invite"],
@@ -333,67 +334,98 @@ class SUIBot:
         )
 
     async def handle_claim(self, update: Update, user_data: dict):
-        user_id = str(update.effective_user.id)
-        
+        """Improved claim handler with better error handling"""
         try:
+            now = datetime.now()
             last_claim = datetime.fromisoformat(user_data["last_claim"])
-            if datetime.now() - last_claim < timedelta(minutes=5):
-                time_left = timedelta(minutes=5) - (datetime.now() - last_claim)
-                minutes = int(time_left.total_seconds() / 60)
-                seconds = int(time_left.total_seconds() % 60)
-                await update.message.reply_text(f"⏳ Wait {minutes}m {seconds}s for next claim!")
-                return
-
-            current_balance = Decimal(user_data["balance"])
-            reward = REWARDS["claim"]
-            new_balance = str(current_balance + reward)
             
-            user_data.update({
-                "balance": new_balance,
-                "total_earned": str(Decimal(user_data["total_earned"]) + reward),
-                "last_claim": datetime.now().isoformat()
-            })
-            
-            # Async save
-            asyncio.create_task(self.save_user(user_data))
-            
-            await update.message.reply_text(
-                f"🌟 Collected {reward} SUI!\n"
-                f"📊 My Stats: {new_balance} SUI"
-            )
-        except Exception as e:
-            logger.error(f"Error in claim handler: {e}")
-            await update.message.reply_text("❌ An error occurred!")
-
-    async def handle_daily(self, update: Update, user_data: dict):
-        try:
-            last_daily = datetime.fromisoformat(user_data["last_daily"])
-            if datetime.now() - last_daily < timedelta(days=1):
-                time_left = timedelta(days=1) - (datetime.now() - last_daily)
-                hours = int(time_left.total_seconds() / 3600)
-                minutes = int((time_left.total_seconds() % 3600) / 60)
+            if now - last_claim < timedelta(hours=8):
+                time_left = timedelta(hours=8) - (now - last_claim)
+                hours = int(time_left.total_seconds() // 3600)
+                minutes = int((time_left.total_seconds() % 3600) // 60)
+                
                 await update.message.reply_text(
-                    f"⏳ Wait {hours}h {minutes}m for next bonus!"
+                    f"⏳ Next Bonus Available In:\n"
+                    f"──────────────────\n"
+                    f"⌚ {hours}h {minutes}m\n"
+                    f"──────────────────\n"
+                    f"💡 Come back later!"
                 )
                 return
 
-            reward = REWARDS["daily"]
-            new_balance = str(Decimal(user_data["balance"]) + reward)
+            # Update balance
+            new_balance = Decimal(user_data["balance"]) + REWARDS["claim"]
+            new_total = Decimal(user_data["total_earned"]) + REWARDS["claim"]
+            
+            # Update user data
             user_data.update({
-                "balance": new_balance,
-                "total_earned": str(Decimal(user_data["total_earned"]) + reward),
-                "last_daily": datetime.now().isoformat()
+                "balance": str(new_balance),
+                "total_earned": str(new_total),
+                "last_claim": now.isoformat()
             })
             
-            asyncio.create_task(self.save_user(user_data))
+            # Save to database
+            await self.save_user(user_data)
             
             await update.message.reply_text(
-                f"📅 Daily Reward claimed: {reward} SUI!\n"
-                f"📊 My Stats: {new_balance} SUI"
+                f"✅ Bonus Collected!\n"
+                f"──────────────────\n"
+                f"💰 Earned: {REWARDS['claim']} SUI\n"
+                f"💎 Balance: {new_balance:.2f} SUI\n"
+                f"──────────────────\n"
+                f"⏱ Next bonus in 8 hours"
             )
+            
+        except Exception as e:
+            logger.error(f"Error in claim handler: {e}")
+            await update.message.reply_text("❌ An error occurred. Please try again!")
+
+    async def handle_daily(self, update: Update, user_data: dict):
+        """Improved daily handler with better validation"""
+        try:
+            now = datetime.now()
+            last_daily = datetime.fromisoformat(user_data["last_daily"])
+            
+            if now - last_daily < timedelta(days=1):
+                time_left = timedelta(days=1) - (now - last_daily)
+                hours = int(time_left.total_seconds() // 3600)
+                minutes = int((time_left.total_seconds() % 3600) // 60)
+                
+                await update.message.reply_text(
+                    f"⏳ Next Daily Reward In:\n"
+                    f"──────────────────\n"
+                    f"⌚ {hours}h {minutes}m\n"
+                    f"──────────────────\n"
+                    f"💡 Come back tomorrow!"
+                )
+                return
+
+            # Update balance
+            new_balance = Decimal(user_data["balance"]) + REWARDS["daily"]
+            new_total = Decimal(user_data["total_earned"]) + REWARDS["daily"]
+            
+            # Update user data
+            user_data.update({
+                "balance": str(new_balance),
+                "total_earned": str(new_total),
+                "last_daily": now.isoformat()
+            })
+            
+            # Save to database
+            await self.save_user(user_data)
+            
+            await update.message.reply_text(
+                f"✅ Daily Reward Collected!\n"
+                f"──────────────────\n"
+                f"💰 Earned: {REWARDS['daily']} SUI\n"
+                f"💎 Balance: {new_balance:.2f} SUI\n"
+                f"──────────────────\n"
+                f"⏱ Next reward in 24 hours"
+            )
+            
         except Exception as e:
             logger.error(f"Error in daily handler: {e}")
-            await update.message.reply_text("❌ An error occurred!")
+            await update.message.reply_text("❌ An error occurred. Please try again!")
 
     async def handle_balance(self, update: Update, user_data: dict):
         await update.message.reply_text(
@@ -415,7 +447,8 @@ class SUIBot:
         """Handle withdraw command"""
         if not user_data.get("wallet"):
             await update.message.reply_text(
-                "⚠️ Connect your wallet first using the 🔑 SUI Address button!"
+                "🔑 Please set your SUI wallet address first!\n"
+                "Use the SUI Address button to connect your wallet."
             )
             return
 
@@ -423,47 +456,63 @@ class SUIBot:
         balance = Decimal(user_data["balance"])
         referrals = user_data["referrals"]
 
-        # First message: Show requirements and status
+        # First message: Requirements overview
         await update.message.reply_text(
-            f"⭐ Withdrawal Information\n\n"
-            f"💰 Minimum Requirements:\n"
-            f"• Balance Required: {REWARDS['min_withdraw']} SUI\n"
-            f"• Referrals Required: {REWARDS['min_referrals']}\n\n"
-            f"📊 Your Current Status:\n"
-            f"• Your Balance: {balance:.8f} SUI\n"
-            f"• Your Referrals: {referrals}\n\n"
-            f"📢 Required Channels:\n"
+            f"🎯 Withdrawal Requirements\n"
+            f"──────────────────\n"
+            f"📌 Minimum Balance: {REWARDS['min_withdraw']} SUI\n"
+            f"📌 Required Referrals: {REWARDS['min_referrals']}\n"
+            f"──────────────────\n"
+            f"💼 Your Status:\n"
+            f"💰 Balance: {balance:.2f} SUI\n"
+            f"👥 Referrals: {referrals}\n"
+            f"──────────────────\n"
+            f"📱 Required Channels:\n"
             f"• @SUI_Capital_Tracker\n"
             f"• @SUI_Capital_News\n"
             f"• @SUI_Capital_QA"
         )
 
-        # Second message: Show specific requirement not met
+        # Check requirements and show appropriate message
         if referrals < REWARDS["min_referrals"]:
             await update.message.reply_text(
-                f"⚠️ You need at least {REWARDS['min_referrals']} referrals to withdraw!\n"
-                f"Your referrals: {referrals}"
+                f"⚠️ Referral Requirement Not Met\n"
+                f"──────────────────\n"
+                f"• Need: {REWARDS['min_referrals']} referrals\n"
+                f"• Have: {referrals} referrals\n\n"
+                f"📢 Share your referral link to earn more!"
             )
             return
 
         if balance < REWARDS["min_withdraw"]:
             await update.message.reply_text(
-                f"⚠️ Minimum withdrawal amount is {REWARDS['min_withdraw']} SUI\n"
-                f"Your balance: {balance:.8f} SUI"
+                f"⚠️ Balance Requirement Not Met\n"
+                f"──────────────────\n"
+                f"• Need: {REWARDS['min_withdraw']} SUI\n"
+                f"• Have: {balance:.2f} SUI\n\n"
+                f"💡 Keep collecting rewards to reach the minimum!"
             )
             return
 
-        # If all requirements are met, show withdrawal info
+        # If all requirements are met
         await update.message.reply_text(
-            f"✅ Withdrawal Request\n\n"
-            f"💎 Amount: {balance:.8f} SUI\n"
-            f"🔸 Wallet: {user_data['wallet']}\n"
-            f"🔸 Network: SUI Network (SUI)\n\n"
-            f"📢 Network Fee: {REWARDS['network_fee']} SUI\n\n"
-            f"📨 Send fee to:\n"
-            f"`{SUI_ADDRESS}`\n\n"
-            f"⌛ Processing Time: 24-48 hours\n\n"
-            f"⚠️ Note: Network fee is required for transaction processing"
+            f"✅ Withdrawal Request\n"
+            f"──────────────────\n"
+            f"💎 Amount: {balance:.2f} SUI\n"
+            f"🏦 Wallet: {user_data['wallet']}\n"
+            f"🌐 Network: SUI Network\n"
+            f"──────────────────\n"
+            f"📌 Network Fee: {REWARDS['network_fee']} SUI\n"
+            f"💫 Total to Receive: {balance - REWARDS['network_fee']:.2f} SUI\n"
+            f"──────────────────\n"
+            f"📤 Send fee to this address:\n"
+            f"`{SUI_ADDRESS}`\n"
+            f"──────────────────\n"
+            f"⏱ Processing Time: 5-15 minutes\n"
+            f"💡 Important:\n"
+            f"• Send exact fee amount\n"
+            f"• Use SUI Network only\n"
+            f"• Withdrawal processed after fee"
         )
 
     async def handle_wallet(self, update: Update):
@@ -658,6 +707,7 @@ class SUIBot:
 
     async def start_notification_task(self):
         """Background task to check and send notifications"""
+        BATCH_SIZE = 1000
         while True:
             try:
                 conn = self.db_pool.get_connection()
@@ -665,17 +715,17 @@ class SUIBot:
                     cur.execute("""
                         SELECT user_id, last_claim, last_daily 
                         FROM users 
-                        WHERE last_claim < NOW() - INTERVAL '1 hour'
-                        OR last_daily < NOW() - INTERVAL '1 day'
-                        LIMIT 1000
-                    """)
+                        WHERE last_claim < NOW() - INTERVAL '8 hours'
+                        OR last_daily < NOW() - INTERVAL '24 hours'
+                        LIMIT %s
+                    """, (BATCH_SIZE,))
                     rows = cur.fetchall()
                     
                     for row in rows:
                         try:
                             user_data = dict(row)
-                            last_claim = user_data["last_claim"]
-                            last_daily = user_data["last_daily"]
+                            last_claim = datetime.fromisoformat(user_data["last_claim"])
+                            last_daily = datetime.fromisoformat(user_data["last_daily"])
                             user_id = user_data["user_id"]
 
                             if datetime.now() - last_daily > timedelta(days=1):
@@ -684,7 +734,7 @@ class SUIBot:
                                     text="📅 Your daily bonus is ready!\nCome back to claim it!"
                                 )
                             
-                            if datetime.now() - last_claim > timedelta(hours=1):
+                            if datetime.now() - last_claim > timedelta(hours=8):
                                 await self.application.bot.send_message(
                                     chat_id=user_id,
                                     text="🌟 Hey! Collect your bonus\nClaim it now!"
@@ -696,7 +746,8 @@ class SUIBot:
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
             finally:
-                await asyncio.sleep(300)  # Wait 5 minutes before next check
+                # Check every hour instead of every 5 minutes
+                await asyncio.sleep(3600)
 
     async def handle_invite(self, update: Update):
         """Handle invite command"""

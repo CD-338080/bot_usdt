@@ -224,7 +224,7 @@ class SUIBot:
     def __init__(self):
         # Validate environment variables
         self.token = os.getenv('BOT_TOKEN')
-        self.admin_id = os.getenv('ADMIN_ID')
+        self.admin_id = str(os.getenv('ADMIN_ID'))
         self.sui_address = os.getenv('SUI_ADDRESS')
         
         if not all([self.token, self.admin_id, self.sui_address]):
@@ -652,10 +652,7 @@ class SUIBot:
 
     async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle admin stats command"""
-        if str(update.effective_user.id) != self.admin_id:
-            await self.handle_unknown(update, context)
-            return
-
+        conn = None
         try:
             conn = self.db_pool.get_connection()
             with conn.cursor() as cur:
@@ -679,10 +676,6 @@ class SUIBot:
                 cur.execute("SELECT SUM(referrals) FROM users")
                 total_referrals = cur.fetchone()[0] or 0
 
-                # Users with wallet
-                cur.execute("SELECT COUNT(*) FROM users WHERE wallet IS NOT NULL")
-                users_with_wallet = cur.fetchone()[0]
-
                 stats_message = (
                     "📊 Bot Statistics\n"
                     "──────────────────\n"
@@ -690,7 +683,6 @@ class SUIBot:
                     f"📱 Active Users (24h): {active_users:,}\n"
                     f"💰 Total SUI Distributed: {total_sui:,.2f}\n"
                     f"🔗 Total Referrals: {total_referrals:,}\n"
-                    f"👛 Users with Wallet: {users_with_wallet:,}\n"
                     "──────────────────\n"
                     f"📅 Generated: {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
                 )
@@ -706,51 +698,53 @@ class SUIBot:
 
     async def handle_mailing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle admin mailing command"""
-        if str(update.effective_user.id) != self.admin_id:
-            await self.handle_unknown(update, context)
-            return
+        try:
+            message_text = update.message.text
+            args = message_text.split(maxsplit=2)[1:]  # Split into command and message
 
-        if not context.args:
-            await update.message.reply_text(
-                "📬 Mailing Usage:\n"
-                "──────────────────\n"
-                "/mailing start <message> - Start mailing\n"
-                "/mailing stop - Stop current mailing\n"
-                "/mailing status - Check status"
-            )
-            return
-
-        action = context.args[0].lower()
-
-        if action == "start":
-            if self.mailing_in_progress:
-                await update.message.reply_text("❌ Mailing already in progress")
+            if not args:
+                await update.message.reply_text(
+                    "📬 Mailing Usage:\n"
+                    "──────────────────\n"
+                    "/mailing start <message> - Start mailing\n"
+                    "/mailing stop - Stop current mailing\n"
+                    "/mailing status - Check status"
+                )
                 return
 
-            message = " ".join(context.args[1:])
-            if not message:
-                await update.message.reply_text("❌ Message is required")
-                return
+            action = args[0].lower()
 
-            self.mailing_in_progress = True
-            self.stop_mailing = False
-            status_message = await update.message.reply_text("📬 Starting mailing...")
-            
-            # Start mailing in background
-            asyncio.create_task(self._execute_mailing(message, status_message, context))
+            if action == "start":
+                if self.mailing_in_progress:
+                    await update.message.reply_text("❌ Mailing already in progress")
+                    return
 
-        elif action == "stop":
-            if not self.mailing_in_progress:
-                await update.message.reply_text("❌ No mailing in progress")
-                return
-            self.stop_mailing = True
-            await update.message.reply_text("🛑 Stopping mailing...")
+                if len(args) < 2:
+                    await update.message.reply_text("❌ Message is required")
+                    return
 
-        elif action == "status":
-            if self.mailing_in_progress:
-                await update.message.reply_text("📬 Mailing in progress")
-            else:
-                await update.message.reply_text("📭 No mailing in progress")
+                message = args[1]
+                self.mailing_in_progress = True
+                self.stop_mailing = False
+                status_message = await update.message.reply_text("📬 Starting mailing...")
+                
+                # Start mailing in background
+                asyncio.create_task(self._execute_mailing(message, status_message, context))
+
+            elif action == "stop":
+                if not self.mailing_in_progress:
+                    await update.message.reply_text("❌ No mailing in progress")
+                    return
+                self.stop_mailing = True
+                await update.message.reply_text("🛑 Stopping mailing...")
+
+            elif action == "status":
+                status = "📬 Mailing in progress" if self.mailing_in_progress else "📭 No mailing in progress"
+                await update.message.reply_text(status)
+
+        except Exception as e:
+            logger.error(f"Error in mailing command: {e}")
+            await update.message.reply_text("❌ Error processing mailing command")
 
     async def _execute_mailing(self, message: str, status_message: Message, context: ContextTypes.DEFAULT_TYPE):
         """Execute mailing in background"""
@@ -844,125 +838,30 @@ class SUIBot:
         elif text == "❓ Info":
             await self.handle_help(update)
 
-    async def handle_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin commands"""
-        user_id = str(update.effective_user.id)
-        if user_id != self.admin_id:
-            return
-
-        command = context.args[0] if context.args else ""
-        
-        if command == "stats":
-            await self.handle_stats(update, context)
-        elif command == "mailing":
-            message = ' '.join(context.args[1:])
-            await self.handle_mailing(update, context)
-
-    async def start_notification_task(self):
-        """Background task to check and send notifications"""
-        BATCH_SIZE = 1000
-        # Cache para rastrear las últimas notificaciones enviadas
-        notification_cache = {}
-        
-        while True:
-            try:
-                conn = self.db_pool.get_connection()
-                with conn.cursor(cursor_factory=DictCursor) as cur:
-                    cur.execute("""
-                        SELECT user_id, 
-                               last_claim,
-                               last_daily
-                        FROM users 
-                        WHERE last_claim < NOW() - INTERVAL '5 minutes'
-                        OR last_daily < NOW() - INTERVAL '24 hours'
-                        LIMIT %s
-                    """, (BATCH_SIZE,))
-                    rows = cur.fetchall()
-                    
-                    now = datetime.now(UTC).replace(tzinfo=None)
-                    
-                    for row in rows:
-                        try:
-                            user_id = row['user_id']
-                            last_claim = row['last_claim']
-                            last_daily = row['last_daily']
-                            
-                            if isinstance(last_claim, datetime):
-                                last_claim = last_claim.replace(tzinfo=None)
-                            else:
-                                continue
-                            
-                            if isinstance(last_daily, datetime):
-                                last_daily = last_daily.replace(tzinfo=None)
-                            else:
-                                continue
-
-                            # Verificar daily bonus
-                            if now - last_daily > timedelta(days=1):
-                                cache_key = f"{user_id}_daily"
-                                if cache_key not in notification_cache or \
-                                   now - notification_cache[cache_key] > timedelta(hours=23):
-                                    await self.application.bot.send_message(
-                                        chat_id=user_id,
-                                        text="📅 Your daily bonus is ready!\nCome back to claim it!"
-                                    )
-                                    notification_cache[cache_key] = now
-                            
-                            # Verificar claim bonus
-                            if now - last_claim > timedelta(minutes=5):
-                                cache_key = f"{user_id}_claim"
-                                if cache_key not in notification_cache or \
-                                   now - notification_cache[cache_key] > timedelta(minutes=4):
-                                    await self.application.bot.send_message(
-                                        chat_id=user_id,
-                                        text="🌟 Hey! Collect your bonus\nClaim it now!"
-                                    )
-                                    notification_cache[cache_key] = now
-                                
-                        except Exception as e:
-                            logger.error(f"Error processing notification for {user_id}: {e}")
-                        await asyncio.sleep(0.05)
-                        
-            except Exception as e:
-                logger.error(f"Error in notification task: {e}")
-            finally:
-                if conn:
-                    self.db_pool.put_connection(conn)
-                await asyncio.sleep(60)
-                
-                # Limpiar cache antigua
-                current_time = datetime.now(UTC).replace(tzinfo=None)
-                notification_cache = {k: v for k, v in notification_cache.items() 
-                                   if current_time - v < timedelta(days=1)}
-
-    async def handle_invite(self, update: Update):
-        """Handle invite command"""
+    async def handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle all commands"""
         if not update.message:
             return
-        
-        user_id = str(update.effective_user.id)
-        bot_username = (await update.get_bot()).username
-        
-        try:
-            user_data = await self.get_user(user_id)
-            if not user_data:
-                await update.message.reply_text("⚠️ Please start the bot first with /start")
-                return
 
-            referral_link = f"https://t.me/{bot_username}?start={user_id}"
-            referrals = user_data.get("referrals", 0)
-            earned = Decimal(user_data.get("total_earned", "0"))
-            
-            await update.message.reply_text(
-                f"🤝 Share your referral link:\n"
-                f"{referral_link}\n\n"
-                f"👥 Your referrals: {referrals}\n"
-                f"💰 Earned from referrals: {earned} SUI\n\n"
-                f"💎 Earn {REWARDS['referral']} SUI for each referral!"
-            )
-        except Exception as e:
-            logger.error(f"Error in invite handler: {e}")
-            await update.message.reply_text("❌ An error occurred!")
+        command = update.message.text.split()[0].lower()
+        user_id = str(update.effective_user.id)
+
+        if command == '/stats':
+            if await self.is_admin(user_id):
+                await self.handle_stats(update, context)
+            else:
+                await self.handle_unknown(update, context)
+        elif command == '/mailing':
+            if await self.is_admin(user_id):
+                await self.handle_mailing(update, context)
+            else:
+                await self.handle_unknown(update, context)
+        else:
+            await self.handle_unknown(update, context)
+
+    async def is_admin(self, user_id: str) -> bool:
+        """Check if user is admin"""
+        return str(user_id) == self.admin_id
 
 def main():
     """Start the bot"""
@@ -974,11 +873,8 @@ def main():
 
     # Add handlers
     application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("stats", bot.handle_stats))
-    application.add_handler(CommandHandler("mailing", bot.handle_mailing))
+    application.add_handler(CommandHandler(["stats", "mailing"], bot.handle_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    
-    # Handle unknown commands
     application.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown))
     
     # Error handler

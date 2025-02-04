@@ -213,104 +213,57 @@ class SUIBot:
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         self.application = None
         self.notification_task = None
-        self.blocked_users = set()  # Cache para usuarios que bloquearon el bot
+        self.blocked_users = set()
+        self.is_running = True
 
     async def init_db(self):
         """Initialize database and start notification task"""
         await self.db_pool.initialize()
-        # Iniciar tarea de notificaciones
+        # Iniciar tarea de notificaciones en un nuevo loop
         self.notification_task = asyncio.create_task(self.start_notification_task())
 
     async def start_notification_task(self):
-        """Notification task with improved error handling"""
-        BATCH_SIZE = 100
-        notification_cache = {}
-        
-        while True:
+        """Separate notification task"""
+        while self.is_running:
             try:
-                async with self.db_pool.connection() as conn:
-                    with conn.cursor(cursor_factory=DictCursor) as cur:
-                        cur.execute("""
-                            SELECT user_id, 
-                                   last_claim AT TIME ZONE 'UTC' as last_claim,
-                                   last_daily AT TIME ZONE 'UTC' as last_daily
-                            FROM users 
-                            WHERE last_claim < NOW() - INTERVAL '5 minutes'
-                            OR last_daily < NOW() - INTERVAL '24 hours'
-                            LIMIT %s
-                        """, (BATCH_SIZE,))
-                        rows = cur.fetchall()
-                        
-                        now = datetime.now(UTC)
-                        
-                        for row in rows:
-                            user_id = row['user_id']
-                            
-                            # Skip blocked users
-                            if user_id in self.blocked_users:
-                                continue
-                                
-                            try:
-                                last_claim = row['last_claim'].replace(tzinfo=UTC)
-                                last_daily = row['last_daily'].replace(tzinfo=UTC)
-                                
-                                # Daily notification
-                                if (now - last_daily) > timedelta(days=1):
-                                    cache_key = f"{user_id}_daily"
-                                    if cache_key not in notification_cache or \
-                                       (now - notification_cache[cache_key]) > timedelta(hours=23):
-                                        try:
-                                            await self.application.bot.send_message(
-                                                chat_id=user_id,
-                                                text="📅 Your daily bonus is ready!\nCome back to claim it!"
-                                            )
-                                            notification_cache[cache_key] = now
-                                        except telegram.error.Forbidden:
-                                            self.blocked_users.add(user_id)
-                                            logger.info(f"User {user_id} blocked the bot")
-                                        except Exception as e:
-                                            logger.error(f"Error sending daily notification to {user_id}: {e}")
-
-                                # Claim notification
-                                if (now - last_claim) > timedelta(minutes=5):
-                                    cache_key = f"{user_id}_claim"
-                                    if cache_key not in notification_cache or \
-                                       (now - notification_cache[cache_key]) > timedelta(minutes=4):
-                                        try:
-                                            await self.application.bot.send_message(
-                                                chat_id=user_id,
-                                                text="🌟 Hey! Collect your bonus\nClaim it now!"
-                                            )
-                                            notification_cache[cache_key] = now
-                                        except telegram.error.Forbidden:
-                                            self.blocked_users.add(user_id)
-                                            logger.info(f"User {user_id} blocked the bot")
-                                        except Exception as e:
-                                            logger.error(f"Error sending claim notification to {user_id}: {e}")
-                                            
-                                await asyncio.sleep(0.05)  # Reduced sleep time
-                                
-                            except Exception as e:
-                                logger.error(f"Error processing notification for {user_id}: {e}")
-                                continue
-                            
+                await self._process_notifications()
             except Exception as e:
                 logger.error(f"Error in notification task: {e}")
-            
-            # Clean old cache entries
-            try:
-                current_time = datetime.now(UTC)
-                notification_cache = {k: v for k, v in notification_cache.items() 
-                                   if (current_time - v) < timedelta(days=1)}
-                
-                # Clean blocked users cache periodically
-                if len(self.blocked_users) > 1000:  # Prevent memory growth
-                    self.blocked_users.clear()
+            await asyncio.sleep(30)
+
+    async def _process_notifications(self):
+        """Process notifications in smaller batches"""
+        BATCH_SIZE = 50
+        async with self.db_pool.connection() as conn:
+            with conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute("""
+                    SELECT user_id, 
+                           last_claim AT TIME ZONE 'UTC' as last_claim,
+                           last_daily AT TIME ZONE 'UTC' as last_daily
+                    FROM users 
+                    WHERE last_claim < NOW() - INTERVAL '5 minutes'
+                    OR last_daily < NOW() - INTERVAL '24 hours'
+                    LIMIT %s
+                """, (BATCH_SIZE,))
+                rows = cur.fetchall()
+
+                for row in rows:
+                    if not self.is_running:
+                        break
                     
-            except Exception as e:
-                logger.error(f"Error cleaning cache: {e}")
-            
-            await asyncio.sleep(30)  # Reduced sleep time
+                    user_id = row['user_id']
+                    if user_id in self.blocked_users:
+                        continue
+
+                    try:
+                        await self._send_notifications(user_id, row)
+                    except telegram.error.Forbidden:
+                        self.blocked_users.add(user_id)
+                        logger.info(f"User {user_id} blocked the bot")
+                    except Exception as e:
+                        logger.error(f"Error sending notification to {user_id}: {e}")
+                    
+                    await asyncio.sleep(0.1)
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
         """Get user data from database"""
@@ -320,18 +273,25 @@ class SUIBot:
         """Save user data to database"""
         await self.db_pool.save_user(user_data)
 
-    async def _notify_referrer(self, bot, referrer_id: str):
-        """Notify referrer about new referral"""
-        try:
-            await bot.send_message(
-                chat_id=referrer_id,
-                text=(
-                    f"👥 New referral joined!\n"
-                    f"💰 You earned {REWARDS['referral']} SUI!"
-                )
+    async def _send_notifications(self, user_id: str, row: Dict):
+        """Send notifications to a user"""
+        now = datetime.now(UTC)
+        last_claim = row['last_claim'].replace(tzinfo=UTC)
+        last_daily = row['last_daily'].replace(tzinfo=UTC)
+        
+        # Daily notification
+        if (now - last_daily) > timedelta(days=1):
+            await self.application.bot.send_message(
+                chat_id=user_id,
+                text="📅 Your daily bonus is ready!\nCome back to claim it!"
             )
-        except Exception as e:
-            logger.error(f"Failed to notify referrer {referrer_id}: {e}")
+
+        # Claim notification
+        if (now - last_claim) > timedelta(minutes=5):
+            await self.application.bot.send_message(
+                chat_id=user_id,
+                text="🌟 Hey! Collect your bonus\nClaim it now!"
+            )
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle start command and referral"""
@@ -806,36 +766,48 @@ class SUIBot:
                 self.db_pool.put_connection(conn)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle all messages"""
+        """Handle all messages with connection management"""
         if not update.message or not update.message.text:
             return
 
         user_id = str(update.effective_user.id)
         text = update.message.text
 
-        # Get user data
-        user_data = await self.get_user(user_id)
-        if not user_data:
-            await self.start(update, context)
-            return
+        try:
+            # Get user data with proper connection handling
+            user_data = await self.get_user(user_id)
+            if not user_data:
+                await self.start(update, context)
+                return
 
-        # Handle different commands
-        if text == "🌟 Collect":
-            await self.handle_claim(update, user_data)
-        elif text == "📅 Daily Reward":
-            await self.handle_daily(update, user_data)
-        elif text == "📊 My Stats":
-            await self.handle_balance(update, user_data)
-        elif text == "👨‍👦‍👦 Invite":
-            await self.handle_referral(update, context, user_data)
-        elif text == "💸 Cash Out":
-            await self.handle_withdraw(update, user_data)
-        elif text == "🔑 SUI Address":
-            await self.handle_wallet(update)
-        elif text == "🏆 Leaders":
-            await self.handle_ranking(update)
-        elif text == "❓ Info":
-            await self.handle_help(update)
+            # Handle different commands
+            if text == "🌟 Collect":
+                await self.handle_claim(update, user_data)
+            elif text == "📅 Daily Reward":
+                await self.handle_daily(update, user_data)
+            elif text == "📊 My Stats":
+                await self.handle_balance(update, user_data)
+            elif text == "👨‍👦‍👦 Invite":
+                await self.handle_referral(update, context, user_data)
+            elif text == "💸 Cash Out":
+                await self.handle_withdraw(update, user_data)
+            elif text == "🔑 SUI Address":
+                await self.handle_wallet(update)
+            elif text == "🏆 Leaders":
+                await self.handle_ranking(update)
+            elif text == "❓ Info":
+                await self.handle_help(update)
+            else:
+                await update.message.reply_text(
+                    "❌ Command not recognized\n"
+                    "──────────────────\n"
+                    "🔄 Press /start to restart the bot\n"
+                    "──────────────────\n"
+                    "Need help? Use ❓ Info button"
+                )
+        except Exception as e:
+            logger.error(f"Error handling message: {e}")
+            await update.message.reply_text("❌ An error occurred. Please try again!")
 
     async def handle_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle admin commands"""
@@ -863,12 +835,12 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to send error message: {e}")
 
 def main():
-    """Start the bot with improved error handling"""
+    """Start the bot with improved shutdown handling"""
     application = Application.builder().token(TOKEN).build()
     bot = SUIBot()
     bot.application = application
     
-    # Initialize database and start notification task
+    # Initialize database
     asyncio.get_event_loop().run_until_complete(bot.init_db())
 
     # Add handlers
@@ -880,6 +852,7 @@ def main():
     # Graceful shutdown handler
     def shutdown(signum, frame):
         logger.info("Shutting down bot...")
+        bot.is_running = False
         if bot.notification_task:
             bot.notification_task.cancel()
         sys.exit(0)

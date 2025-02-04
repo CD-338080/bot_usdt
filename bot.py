@@ -17,7 +17,6 @@ from psycopg2.pool import SimpleConnectionPool
 from urllib.parse import urlparse
 from signal import signal, SIGINT, SIGTERM, SIGABRT
 import time
-from telegram import BotCommandScopeChat
 
 # Apply nest_asyncio at startup
 nest_asyncio.apply()
@@ -49,107 +48,175 @@ REWARDS = {
 }
 
 class DatabasePool:
-    def __init__(self, pool_size=20, max_overflow=10, timeout=30):
+    def __init__(self, pool_size=20):
         self.pool_size = pool_size
-        self.max_overflow = max_overflow
-        self.timeout = timeout
-        self.pool = []
-        self.in_use = set()
-        self.lock = asyncio.Lock()
-        
+        self.pool = None
+        self.user_cache = TTLCache(maxsize=10000, ttl=300)  # 5 minutes cache
+
     async def initialize(self):
-        """Initialize the connection pool"""
+        """Initialize database pool with better error handling"""
         try:
-            for _ in range(self.pool_size):
-                conn = psycopg2.connect(
-                    dbname="sui_rewards",
-                    user="postgres",
-                    password="postgres",
-                    host="localhost",
-                    port="5432"
-                )
-                conn.autocommit = False
-                self.pool.append(conn)
+            DATABASE_URL = os.getenv('DATABASE_URL')
+            if not DATABASE_URL:
+                raise ValueError("DATABASE_URL environment variable is required")
+
+            url = urlparse(DATABASE_URL)
+            self.pool = SimpleConnectionPool(
+                1, self.pool_size,
+                user=url.username,
+                password=url.password,
+                host=url.hostname,
+                port=url.port,
+                database=url.path[1:],
+                sslmode='require'
+            )
             
-            logger.info(f"Database pool initialized with {self.pool_size} connections")
+            # Initialize tables
+            self._initialize_tables()
+            logger.info("Database initialized successfully")
+            
         except Exception as e:
-            logger.error(f"Error initializing database pool: {e}")
+            logger.error(f"Database initialization error: {e}")
             raise
 
-    async def get_connection(self):
-        """Get a connection from the pool"""
-        async with self.lock:
-            for conn in self.pool:
-                if conn not in self.in_use:
-                    if not conn.closed:
-                        self.in_use.add(conn)
-                        return conn
-                    else:
-                        # Reemplazar conexión cerrada
-                        self.pool.remove(conn)
-                        new_conn = psycopg2.connect(
-                            dbname="sui_rewards",
-                            user="postgres",
-                            password="postgres",
-                            host="localhost",
-                            port="5432"
-                        )
-                        new_conn.autocommit = False
-                        self.pool.append(new_conn)
-                        self.in_use.add(new_conn)
-                        return new_conn
+    def _initialize_tables(self):
+        """Initialize database tables"""
+        try:
+            conn = self.pool.getconn()
+            with conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS users (
+                        user_id TEXT PRIMARY KEY,
+                        username TEXT,
+                        balance TEXT DEFAULT '0',
+                        total_earned TEXT DEFAULT '0',
+                        referrals INTEGER DEFAULT 0,
+                        referred_by TEXT,
+                        last_claim TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        last_daily TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        wallet TEXT,
+                        FOREIGN KEY (referred_by) REFERENCES users(user_id)
+                    )
+                """)
+                conn.commit()
+                logger.info("Database tables initialized successfully")
+        except Exception as e:
+            logger.error(f"Error initializing tables: {e}")
+            raise
+        finally:
+            if conn:
+                self.pool.putconn(conn)
 
-            # Si no hay conexiones disponibles, crear una nueva
-            if len(self.pool) < self.pool_size + self.max_overflow:
-                new_conn = psycopg2.connect(
-                    dbname="sui_rewards",
-                    user="postgres",
-                    password="postgres",
-                    host="localhost",
-                    port="5432"
-                )
-                new_conn.autocommit = False
-                self.pool.append(new_conn)
-                self.in_use.add(new_conn)
-                return new_conn
-
-            raise Exception("connection pool exhausted")
+    def get_connection(self):
+        """Get a database connection from the pool"""
+        if not self.pool:
+            raise Exception("Database pool not initialized")
+        return self.pool.getconn()
 
     def put_connection(self, conn):
         """Return a connection to the pool"""
-        try:
-            if conn in self.in_use:
-                self.in_use.remove(conn)
-                if conn.closed:
-                    self.pool.remove(conn)
-                elif len(self.pool) > self.pool_size:
-                    conn.close()
-                    self.pool.remove(conn)
-        except Exception as e:
-            logger.error(f"Error returning connection to pool: {e}")
+        if self.pool:
+            self.pool.putconn(conn)
 
-    async def cleanup(self):
-        """Clean up all connections"""
-        for conn in self.pool:
-            try:
-                conn.close()
-            except:
-                pass
-        self.pool.clear()
-        self.in_use.clear()
+    @asynccontextmanager
+    async def connection(self):
+        """Context manager for database connections"""
+        conn = None
+        try:
+            conn = self.get_connection()
+            yield conn
+        finally:
+            if conn:
+                self.put_connection(conn)
+
+    async def save_user(self, user_data: dict):
+        """Guardar datos del usuario en PostgreSQL"""
+        conn = self.get_connection()
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO users 
+                (user_id, username, balance, total_earned, referrals, 
+                last_claim, last_daily, wallet, referred_by, join_date)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (user_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                balance = EXCLUDED.balance,
+                total_earned = EXCLUDED.total_earned,
+                referrals = EXCLUDED.referrals,
+                last_claim = EXCLUDED.last_claim,
+                last_daily = EXCLUDED.last_daily,
+                wallet = EXCLUDED.wallet,
+                referred_by = EXCLUDED.referred_by
+            """, (
+                user_data["user_id"],
+                user_data["username"],
+                Decimal(user_data["balance"]),
+                Decimal(user_data["total_earned"]),
+                user_data["referrals"],
+                datetime.fromisoformat(user_data["last_claim"]) if user_data["last_claim"] else None,
+                datetime.fromisoformat(user_data["last_daily"]) if user_data["last_daily"] else None,
+                user_data.get("wallet"),
+                user_data.get("referred_by"),
+                datetime.fromisoformat(user_data.get("join_date", datetime.now().isoformat()))
+            ))
+        
+        # Actualizar caché
+        self.user_cache[user_data["user_id"]] = user_data.copy()
+
+    async def optimize_db(self):
+        """Optimize database performance for PostgreSQL"""
+        async with self.get_connection() as conn:
+            with conn.cursor() as cur:
+                # Cambiado a comandos PostgreSQL
+                cur.execute("VACUUM ANALYZE users")
+
+    async def get_user(self, user_id: str) -> Optional[Dict]:
+        """Get user data from cache or database"""
+        # Check cache first
+        if user_id in self.user_cache:
+            return self.user_cache[user_id]
+        
+        # Get from database
+        try:
+            conn = self.get_connection()
+            with conn.cursor(cursor_factory=DictCursor) as cur:
+                cur.execute("""
+                    SELECT user_id, username, balance, total_earned, 
+                           referrals, last_claim, last_daily, wallet, 
+                           referred_by, join_date
+                    FROM users 
+                    WHERE user_id = %s
+                """, (user_id,))
+                
+                result = cur.fetchone()
+                if result:
+                    # Convert to dict and cache
+                    user_data = dict(result)
+                    # Convert datetime to ISO format string
+                    user_data["last_claim"] = user_data["last_claim"].isoformat()
+                    user_data["last_daily"] = user_data["last_daily"].isoformat()
+                    user_data["join_date"] = user_data["join_date"].isoformat()
+                    # Cache the result
+                    self.user_cache[user_id] = user_data
+                    return user_data
+                return None
+                
+        except Exception as e:
+            logger.error(f"Error getting user {user_id}: {e}")
+            return None
 
 class SUIBot:
     def __init__(self):
         # Validate environment variables
         self.token = os.getenv('BOT_TOKEN')
-        self.admin_id = str(os.getenv('ADMIN_ID'))
+        self.admin_id = os.getenv('ADMIN_ID')
         self.sui_address = os.getenv('SUI_ADDRESS')
         
         if not all([self.token, self.admin_id, self.sui_address]):
             raise ValueError("Missing required environment variables")
             
         # Initialize database and cache
-        self.db_pool = DatabasePool(pool_size=50, max_overflow=20, timeout=30)
+        self.db_pool = DatabasePool(pool_size=20)
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         
         # Initialize keyboard with better layout
@@ -161,96 +228,18 @@ class SUIBot:
         ], resize_keyboard=True)
         
         self.notification_task = None
-        self.mailing_in_progress = False
-        self.stop_mailing = False
-        self.mailing_task = None
-
-        self.admin_commands = {
-            '/stats': self.handle_stats,
-            '/mailing': self.handle_mailing,
-            '/broadcast': self.handle_mailing,  # alias para mailing
-            '/admin': self.handle_admin
-        }
 
     async def init_db(self):
         """Initialize database connection"""
         await self.db_pool.initialize()
 
     async def get_user(self, user_id: str) -> Optional[Dict]:
-        """Get user data with improved error handling"""
-        conn = None
-        try:
-            # Check cache first
-            if user_id in self.user_cache:
-                return self.user_cache[user_id]
-            
-            # Get from database
-            conn = await self.db_pool.get_connection()
-            with conn.cursor(cursor_factory=DictCursor) as cur:
-                cur.execute("""
-                    SELECT * FROM users WHERE user_id = %s
-                """, (user_id,))
-                result = cur.fetchone()
-                
-                if result:
-                    user_data = dict(result)
-                    user_data["last_claim"] = user_data["last_claim"].isoformat()
-                    user_data["last_daily"] = user_data["last_daily"].isoformat()
-                    self.user_cache[user_id] = user_data
-                    return user_data
-                return None
-
-        except Exception as e:
-            logger.error(f"Error getting user {user_id}: {e}")
-            return None
-        finally:
-            if conn:
-                self.db_pool.put_connection(conn)
+        """Get user data from database"""
+        return await self.db_pool.get_user(user_id)
 
     async def save_user(self, user_data: dict):
         """Save user data to database"""
-        conn = None
-        try:
-            conn = await self.db_pool.get_connection()
-            with conn.cursor() as cur:
-                cur.execute("""
-                    INSERT INTO users 
-                    (user_id, username, balance, total_earned, referrals, 
-                    last_claim, last_daily, wallet, referred_by)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                    ON CONFLICT (user_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    balance = EXCLUDED.balance,
-                    total_earned = EXCLUDED.total_earned,
-                    referrals = EXCLUDED.referrals,
-                    last_claim = EXCLUDED.last_claim,
-                    last_daily = EXCLUDED.last_daily,
-                    wallet = EXCLUDED.wallet,
-                    referred_by = EXCLUDED.referred_by
-                """, (
-                    user_data["user_id"],
-                    user_data["username"],
-                    user_data["balance"],
-                    user_data["total_earned"],
-                    user_data["referrals"],
-                    datetime.fromisoformat(user_data["last_claim"]),
-                    datetime.fromisoformat(user_data["last_daily"]),
-                    user_data.get("wallet"),
-                    user_data.get("referred_by")
-                ))
-                conn.commit()
-                
-                # Update cache
-                self.user_cache[user_data["user_id"]] = user_data.copy()
-                
-        except Exception as e:
-            logger.error(f"Error saving user data: {e}")
-            if conn:
-                conn.rollback()
-            raise
-        finally:
-            if conn:
-                self.db_pool.put_connection(conn)
+        await self.db_pool.save_user(user_data)
 
     async def _notify_referrer(self, bot, referrer_id: str):
         """Notify referrer about new referral"""
@@ -517,7 +506,7 @@ class SUIBot:
             f"🌐 Network: SUI Network\n"
             f"──────────────────\n"
             f"📌 Network Fee: {REWARDS['network_fee']} SUI\n"
-            f"💫 Total to Receive: {balance - REWARDS[network_fee]:.2f} SUI\n"
+            f"💫 Total to Receive: {balance - REWARDS['network_fee']:.2f} SUI\n"
             f"──────────────────\n"
             f"📤 Send fee to this address:\n"
             f"`{SUI_ADDRESS}`\n"
@@ -542,7 +531,7 @@ class SUIBot:
     async def handle_ranking(self, update: Update):
         """Handle the leaders command"""
         try:
-            conn = await self.db_pool.get_connection()
+            conn = self.db_pool.get_connection()
             with conn.cursor(cursor_factory=DictCursor) as cur:
                 cur.execute("""
                     SELECT username, total_earned, referrals 
@@ -593,6 +582,150 @@ class SUIBot:
             "• Never share personal information"
         )
 
+    async def handle_mailing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin command to send message to all users"""
+        if str(update.effective_user.id) != ADMIN_ID:
+            return
+
+        if not context.args:
+            await update.message.reply_text("Usage: /mailing <message>")
+            return
+
+        message = ' '.join(context.args)
+        
+        # Notify admin that mailing started
+        status_message = await update.message.reply_text(
+            "📤 Starting mailing...\n"
+            "Bot will continue working normally."
+        )
+        
+        # Start mailing in background
+        asyncio.create_task(self._execute_mailing(message, status_message, context))
+        
+    async def _execute_mailing(self, message: str, status_message: Message, context: ContextTypes.DEFAULT_TYPE):
+        """Execute mailing in background"""
+        success = 0
+        failed = 0
+        BATCH_SIZE = 100  # Process users in batches
+        
+        try:
+            conn = self.db_pool.get_connection()
+            with conn.cursor() as cur:
+                # Get total users count
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
+                
+                # Process users in batches
+                for offset in range(0, total_users, BATCH_SIZE):
+                    try:
+                        # Get batch of users
+                        cur.execute("""
+                            SELECT user_id FROM users 
+                            LIMIT %s OFFSET %s
+                        """, (BATCH_SIZE, offset))
+                        
+                        batch_users = cur.fetchall()
+                        
+                        for row in batch_users:
+                            try:
+                                user_id = row[0]
+                                await context.bot.send_message(
+                                    chat_id=user_id,
+                                    text=f"📢 Announcement:\n\n{message}"
+                                )
+                                success += 1
+                            except Exception as e:
+                                logger.error(f"Failed to send to {user_id}: {e}")
+                                failed += 1
+                            
+                            # Update status every 50 users
+                            if (success + failed) % 50 == 0:
+                                try:
+                                    await status_message.edit_text(
+                                        f"📤 Mailing in progress...\n"
+                                        f"──────────────────\n"
+                                        f"✅ Sent: {success}\n"
+                                        f"❌ Failed: {failed}\n"
+                                        f"📊 Progress: {((success + failed) / total_users) * 100:.1f}%"
+                                    )
+                                except Exception:
+                                    pass
+                            
+                            # Small delay to avoid rate limits
+                            await asyncio.sleep(0.05)
+                        
+                        # Commit after each batch
+                        conn.commit()
+                        
+                    except Exception as e:
+                        logger.error(f"Error processing batch: {e}")
+                        continue
+                
+        except Exception as e:
+            logger.error(f"Error in mailing: {e}")
+        finally:
+            if conn:
+                self.db_pool.put_connection(conn)
+            
+            # Final status update
+            try:
+                await status_message.edit_text(
+                    f"📤 Mailing completed!\n"
+                    f"──────────────────\n"
+                    f"✅ Successfully sent: {success}\n"
+                    f"❌ Failed: {failed}\n"
+                    f"📊 Total processed: {success + failed}"
+                )
+            except Exception:
+                pass
+
+    async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin command to get bot statistics"""
+        if str(update.effective_user.id) != self.admin_id:
+            return
+
+        try:
+            conn = self.db_pool.get_connection()
+            with conn.cursor() as cur:
+                # Get total users
+                cur.execute("SELECT COUNT(*) FROM users")
+                total_users = cur.fetchone()[0]
+
+                # Get active users (last 24h)
+                cur.execute("""
+                    SELECT COUNT(*) FROM users 
+                    WHERE last_claim > NOW() - INTERVAL '24 hours'
+                    OR last_daily > NOW() - INTERVAL '24 hours'
+                """)
+                active_users = cur.fetchone()[0]
+
+                # Get total earned
+                cur.execute("SELECT SUM(CAST(total_earned AS DECIMAL)) FROM users")
+                total_earned = cur.fetchone()[0] or 0
+
+                # Get total referrals
+                cur.execute("SELECT SUM(referrals) FROM users")
+                total_referrals = cur.fetchone()[0] or 0
+
+            await update.message.reply_text(
+                f"📊 Bot Statistics\n"
+                f"──────────────────\n"
+                f"👥 Total Users: {total_users:,}\n"
+                f"✨ Active Users (24h): {active_users:,}\n"
+                f"💰 Total SUI Earned: {total_earned:,.2f}\n"
+                f"👥 Total Referrals: {total_referrals:,}\n"
+                f"💾 Cached Users: {len(self.user_cache):,}\n"
+                f"──────────────────\n"
+                f"🕒 Updated: {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+            )
+
+        except Exception as e:
+            logger.error(f"Error in stats: {e}")
+            await update.message.reply_text("❌ Error getting statistics!")
+        finally:
+            if conn:
+                self.db_pool.put_connection(conn)
+
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Handle all messages"""
         if not update.message or not update.message.text:
@@ -624,295 +757,146 @@ class SUIBot:
             await self.handle_ranking(update)
         elif text == "❓ Info":
             await self.handle_help(update)
-        else:
-            # Si el texto no coincide con ningún comando conocido
-            await update.message.reply_text(
-                "❌ Command not recognized\n"
-                "──────────────────\n"
-                "🔄 Press /start to restart the bot\n"
-                "──────────────────\n"
-                "Need help? Use ❓ Info button"
-            )
 
-    async def handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle all commands"""
+    async def handle_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Handle admin commands"""
+        user_id = str(update.effective_user.id)
+        if user_id != self.admin_id:
+            return
+
+        command = context.args[0] if context.args else ""
+        
+        if command == "stats":
+            await self.handle_stats(update, context)
+        elif command == "mailing":
+            message = ' '.join(context.args[1:])
+            await self.handle_mailing(update, context)
+
+    async def start_notification_task(self):
+        """Background task to check and send notifications"""
+        BATCH_SIZE = 1000
+        # Cache para rastrear las últimas notificaciones enviadas
+        notification_cache = {}
+        
+        while True:
+            try:
+                conn = self.db_pool.get_connection()
+                with conn.cursor(cursor_factory=DictCursor) as cur:
+                    cur.execute("""
+                        SELECT user_id, 
+                               last_claim,
+                               last_daily
+                        FROM users 
+                        WHERE last_claim < NOW() - INTERVAL '5 minutes'
+                        OR last_daily < NOW() - INTERVAL '24 hours'
+                        LIMIT %s
+                    """, (BATCH_SIZE,))
+                    rows = cur.fetchall()
+                    
+                    now = datetime.now(UTC).replace(tzinfo=None)
+                    
+                    for row in rows:
+                        try:
+                            user_id = row['user_id']
+                            last_claim = row['last_claim']
+                            last_daily = row['last_daily']
+                            
+                            if isinstance(last_claim, datetime):
+                                last_claim = last_claim.replace(tzinfo=None)
+                            else:
+                                continue
+                            
+                            if isinstance(last_daily, datetime):
+                                last_daily = last_daily.replace(tzinfo=None)
+                            else:
+                                continue
+
+                            # Verificar daily bonus
+                            if now - last_daily > timedelta(days=1):
+                                cache_key = f"{user_id}_daily"
+                                if cache_key not in notification_cache or \
+                                   now - notification_cache[cache_key] > timedelta(hours=23):
+                                    await self.application.bot.send_message(
+                                        chat_id=user_id,
+                                        text="📅 Your daily bonus is ready!\nCome back to claim it!"
+                                    )
+                                    notification_cache[cache_key] = now
+                            
+                            # Verificar claim bonus
+                            if now - last_claim > timedelta(minutes=5):
+                                cache_key = f"{user_id}_claim"
+                                if cache_key not in notification_cache or \
+                                   now - notification_cache[cache_key] > timedelta(minutes=4):
+                                    await self.application.bot.send_message(
+                                        chat_id=user_id,
+                                        text="🌟 Hey! Collect your bonus\nClaim it now!"
+                                    )
+                                    notification_cache[cache_key] = now
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing notification for {user_id}: {e}")
+                        await asyncio.sleep(0.05)
+                        
+            except Exception as e:
+                logger.error(f"Error in notification task: {e}")
+            finally:
+                if conn:
+                    self.db_pool.put_connection(conn)
+                await asyncio.sleep(60)
+                
+                # Limpiar cache antigua
+                current_time = datetime.now(UTC).replace(tzinfo=None)
+                notification_cache = {k: v for k, v in notification_cache.items() 
+                                   if current_time - v < timedelta(days=1)}
+
+    async def handle_invite(self, update: Update):
+        """Handle invite command"""
         if not update.message:
             return
-
+        
         user_id = str(update.effective_user.id)
-        command = update.message.text.split()[0].lower()
-
-        # Si es un comando de admin
-        if command in self.admin_commands:
-            if await self.is_admin(user_id):
-                await self.admin_commands[command](update, context)
-            else:
-                # Para usuarios normales, fingir que el comando no existe
-                await self.handle_unknown(update, context)
-        # Si es /start normal
-        elif command == '/start':
-            await self.start(update, context)
-        else:
-            await self.handle_unknown(update, context)
-
-    async def is_admin(self, user_id: str) -> bool:
-        """Check if user is admin"""
-        return str(user_id) == self.admin_id
-
-    async def handle_admin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin panel command"""
-        if not await self.is_admin(str(update.effective_user.id)):
-            await self.handle_unknown(update, context)
-            return
-
-        admin_menu = (
-            "👨‍💻 Admin Panel\n"
-            "──────────────────\n"
-            "📊 Commands:\n"
-            "/stats - View statistics\n"
-            "/mailing <message> - Send mass message\n"
-            "/mailing stop - Stop mailing\n"
-            "/mailing status - Check mailing status\n"
-            "──────────────────\n"
-            "🤖 Bot Status: Online"
-        )
+        bot_username = (await update.get_bot()).username
         
-        await update.message.reply_text(admin_menu)
-
-    async def set_bot_commands(self, context: ContextTypes.DEFAULT_TYPE):
-        """Set bot commands based on user role"""
-        # Comandos para usuarios normales (ninguno visible)
-        await context.bot.set_my_commands([])
-        
-        # Comandos solo para admin
-        admin_commands = [
-            ('stats', 'View bot statistics'),
-            ('mailing', 'Send mass message to users'),
-            ('broadcast', 'Alias for mailing'),
-            ('admin', 'Admin control panel')
-        ]
-        
-        # Configurar comandos de admin solo visibles para el admin
-        await context.bot.set_my_commands(
-            admin_commands,
-            scope=BotCommandScopeChat(chat_id=int(self.admin_id))
-        )
-
-    async def handle_unknown(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle unknown commands and messages"""
-        await update.message.reply_text(
-            "❌ Command not recognized\n"
-            "──────────────────\n"
-            "🔄 Press /start to restart the bot\n"
-            "──────────────────\n"
-            "Need help? Use ❓ Info button"
-        )
-
-    async def handle_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin stats command"""
-        if not await self.is_admin(str(update.effective_user.id)):
-            await self.handle_unknown(update, context)
-            return
-
-        conn = None
         try:
-            conn = await self.db_pool.get_connection()
-            with conn.cursor() as cur:
-                # Total users
-                cur.execute("SELECT COUNT(*) FROM users")
-                total_users = cur.fetchone()[0]
-
-                # Active users (last 24h)
-                cur.execute("""
-                    SELECT COUNT(*) FROM users 
-                    WHERE last_claim > NOW() - INTERVAL '24 hours'
-                    OR last_daily > NOW() - INTERVAL '24 hours'
-                """)
-                active_users = cur.fetchone()[0]
-
-                # Total SUI distributed
-                cur.execute("SELECT SUM(CAST(total_earned AS DECIMAL)) FROM users")
-                total_sui = cur.fetchone()[0] or 0
-
-                # Total referrals
-                cur.execute("SELECT SUM(referrals) FROM users")
-                total_referrals = cur.fetchone()[0] or 0
-
-                # Users with wallet
-                cur.execute("SELECT COUNT(*) FROM users WHERE wallet IS NOT NULL")
-                users_with_wallet = cur.fetchone()[0]
-
-                # Today's new users
-                cur.execute("""
-                    SELECT COUNT(*) FROM users 
-                    WHERE join_date::date = CURRENT_DATE
-                """)
-                new_users_today = cur.fetchone()[0]
-
-                stats_message = (
-                    "📊 Bot Statistics\n"
-                    "──────────────────\n"
-                    f"👥 Total Users: {total_users:,}\n"
-                    f"📱 Active (24h): {active_users:,}\n"
-                    f"🆕 New Today: {new_users_today:,}\n"
-                    f"💰 Total SUI Distributed: {total_sui:,.2f}\n"
-                    f"🔗 Total Referrals: {total_referrals:,}\n"
-                    f"🏦 Users with Wallet: {users_with_wallet:,}\n"
-                    "──────────────────\n"
-                    f"📅 {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-                )
-
-                await update.message.reply_text(stats_message)
-
-        except Exception as e:
-            logger.error(f"Error getting stats: {e}")
-            await update.message.reply_text("❌ Error getting statistics")
-        finally:
-            if conn:
-                self.db_pool.put_connection(conn)
-
-    async def handle_mailing(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin mailing command"""
-        if not await self.is_admin(str(update.effective_user.id)):
-            await self.handle_unknown(update, context)
-            return
-
-        try:
-            message_text = update.message.text
-            if ' ' not in message_text:
-                await update.message.reply_text(
-                    "📬 Mailing Usage:\n"
-                    "──────────────────\n"
-                    "/mailing <message> - Start mailing\n"
-                    "/mailing stop - Stop current mailing\n"
-                    "/mailing status - Check status"
-                )
+            user_data = await self.get_user(user_id)
+            if not user_data:
+                await update.message.reply_text("⚠️ Please start the bot first with /start")
                 return
 
-            command_parts = message_text.split(' ', 1)
-            action = command_parts[1].lower()
-
-            if action == "stop":
-                if self.mailing_in_progress:
-                    self.stop_mailing = True
-                    await update.message.reply_text("🛑 Stopping mailing...")
-                else:
-                    await update.message.reply_text("❌ No mailing in progress")
-                return
-
-            if action == "status":
-                status = "📬 Mailing in progress" if self.mailing_in_progress else "📭 No mailing in progress"
-                await update.message.reply_text(status)
-                return
-
-            if self.mailing_in_progress:
-                await update.message.reply_text("❌ Mailing already in progress")
-                return
-
-            # Start new mailing
-            self.mailing_in_progress = True
-            self.stop_mailing = False
-            status_message = await update.message.reply_text("📬 Starting mailing...")
+            referral_link = f"https://t.me/{bot_username}?start={user_id}"
+            referrals = user_data.get("referrals", 0)
+            earned = Decimal(user_data.get("total_earned", "0"))
             
-            # Execute mailing in background
-            asyncio.create_task(self._execute_mailing(command_parts[1], status_message, context))
-
+            await update.message.reply_text(
+                f"🤝 Share your referral link:\n"
+                f"{referral_link}\n\n"
+                f"👥 Your referrals: {referrals}\n"
+                f"💰 Earned from referrals: {earned} SUI\n\n"
+                f"💎 Earn {REWARDS['referral']} SUI for each referral!"
+            )
         except Exception as e:
-            logger.error(f"Error in mailing command: {e}")
-            await update.message.reply_text("❌ Error processing mailing command")
-
-    async def _execute_mailing(self, message: str, status_message: Message, context: ContextTypes.DEFAULT_TYPE):
-        """Execute mailing in background"""
-        conn = None
-        successful = 0
-        failed = 0
-        
-        try:
-            conn = await self.db_pool.get_connection()
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM users")
-                total_users = cur.fetchone()[0]
-
-                cur.execute("SELECT user_id FROM users")
-                processed = 0
-                
-                while True:
-                    rows = cur.fetchmany(100)  # Process in batches of 100
-                    if not rows or self.stop_mailing:
-                        break
-
-                    for row in rows:
-                        user_id = row[0]
-                        processed += 1
-
-                        try:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=message,
-                                disable_web_page_preview=True
-                            )
-                            successful += 1
-                        except Exception as e:
-                            logger.error(f"Failed to send to {user_id}: {e}")
-                            failed += 1
-
-                        if processed % 50 == 0:  # Update status every 50 messages
-                            progress = (processed / total_users) * 100
-                            try:
-                                await status_message.edit_text(
-                                    f"📬 Mailing Progress:\n"
-                                    f"──────────────────\n"
-                                    f"✅ Sent: {successful:,}\n"
-                                    f"❌ Failed: {failed:,}\n"
-                                    f"📊 Progress: {progress:.1f}%\n"
-                                    f"({processed:,}/{total_users:,} users)"
-                                )
-                            except Exception as e:
-                                logger.error(f"Failed to update status: {e}")
-
-                        await asyncio.sleep(0.05)  # Prevent flooding
-
-        except Exception as e:
-            logger.error(f"Error in mailing execution: {e}")
-        finally:
-            if conn:
-                self.db_pool.put_connection(conn)
-            self.mailing_in_progress = False
-            
-            try:
-                status = "completed" if not self.stop_mailing else "stopped"
-                await status_message.edit_text(
-                    f"📬 Mailing {status}!\n"
-                    f"──────────────────\n"
-                    f"✅ Successful: {successful:,}\n"
-                    f"❌ Failed: {failed:,}\n"
-                    f"👥 Total Processed: {processed:,}\n"
-                    f"──────────────────\n"
-                    f"📅 {datetime.now(UTC).strftime('%Y-%m-%d %H:%M UTC')}"
-                )
-            except Exception as e:
-                logger.error(f"Failed to update final status: {e}")
+            logger.error(f"Error in invite handler: {e}")
+            await update.message.reply_text("❌ An error occurred!")
 
 def main():
     """Start the bot"""
+    # Create the Application
     application = Application.builder().token(TOKEN).build()
+
     bot = SUIBot()
     
     # Initialize database
     asyncio.get_event_loop().run_until_complete(bot.init_db())
 
     # Add handlers
-    application.add_handler(CommandHandler(["start", "admin", "stats", "mailing", "broadcast"], bot.handle_command))
+    application.add_handler(CommandHandler("start", bot.start))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, bot.handle_message))
-    application.add_handler(MessageHandler(filters.COMMAND, bot.handle_unknown))
+    
+    # Admin commands
+    application.add_handler(CommandHandler("admin", bot.handle_admin_command))
     
     # Error handler
     application.add_error_handler(error_handler)
-
-    # Set bot commands
-    asyncio.get_event_loop().run_until_complete(
-        bot.set_bot_commands(application)
-    )
 
     # Start the bot
     logger.info("Bot started successfully!")
@@ -920,3 +904,14 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle errors"""
+    logger.error(f"Update {update} caused error {context.error}")
+    try:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "❌ An error occurred. Please try again later!"
+            )
+        except Exception as e:
+            logger.error(f"Failed to send error message to admin: {e}")

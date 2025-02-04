@@ -238,7 +238,7 @@ class DatabasePool:
 class SUIBot:
     def __init__(self):
         self.db_pool = DatabasePool(pool_size=20)
-        self.admin_id = ADMIN_ID
+        self.admin_id = str(ADMIN_ID)
         self.user_cache = TTLCache(maxsize=10000, ttl=300)
         self.application = None
         self.blocked_users = set()
@@ -626,56 +626,71 @@ class SUIBot:
         )
 
     async def handle_admin_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Handle admin commands with improved security"""
+        """Handle admin commands"""
         if not update.message:
             return
-            
+
         user_id = str(update.effective_user.id)
         
-        # Verificación de admin mejorada
-        if user_id != str(self.admin_id):  # Convertir ambos a string para comparación segura
+        # Debug log para verificar IDs
+        logger.info(f"Admin command attempt - User ID: {user_id}, Admin ID: {self.admin_id}")
+        
+        if user_id != self.admin_id:
             logger.warning(f"Unauthorized admin access attempt from user {user_id}")
-            await update.message.reply_text("❌ You are not authorized to use admin commands.")
+            await update.message.reply_text("❌ Unauthorized access")
             return
 
-        if not context.args:
-            await update.message.reply_text(
-                "📋 Admin Commands:\n"
-                "──────────────────\n"
-                "/admin stats - Show statistics\n"
-                "/admin broadcast <message> - Send to all\n"
-                "/admin addbalance <user_id> <amount> - Add balance\n"
-                "/admin removeuser <user_id> - Remove user\n"
-                "──────────────────"
-            )
-            return
-
-        command = context.args[0].lower()
         try:
+            if not context.args:
+                await update.message.reply_text(
+                    "📋 Admin Commands:\n"
+                    "──────────────────\n"
+                    "1️⃣ /admin stats\n"
+                    "2️⃣ /admin broadcast <message>\n"
+                    "3️⃣ /admin addbalance <user_id> <amount>\n"
+                    "4️⃣ /admin removeuser <user_id>\n"
+                    "──────────────────"
+                )
+                return
+
+            command = context.args[0].lower()
+            
+            # Debug log para comando
+            logger.info(f"Admin command: {command} with args: {context.args}")
+
             if command == "stats":
                 await self.handle_admin_stats(update)
-            elif command == "broadcast" and len(context.args) > 1:
+                
+            elif command == "broadcast":
+                if len(context.args) < 2:
+                    await update.message.reply_text("❌ Please provide a message to broadcast")
+                    return
                 message = ' '.join(context.args[1:])
                 await self.handle_admin_broadcast(update, message)
-            elif command == "addbalance" and len(context.args) == 3:
-                user_id = context.args[1]
+                
+            elif command == "addbalance":
+                if len(context.args) != 3:
+                    await update.message.reply_text("❌ Format: /admin addbalance <user_id> <amount>")
+                    return
+                target_user_id = context.args[1]
                 amount = context.args[2]
-                await self.handle_admin_add_balance(update, user_id, amount)
-            elif command == "removeuser" and len(context.args) == 2:
-                user_id = context.args[1]
-                await self.handle_admin_remove_user(update, user_id)
+                await self.handle_admin_add_balance(update, target_user_id, amount)
+                
+            elif command == "removeuser":
+                if len(context.args) != 2:
+                    await update.message.reply_text("❌ Format: /admin removeuser <user_id>")
+                    return
+                target_user_id = context.args[1]
+                await self.handle_admin_remove_user(update, target_user_id)
+                
             else:
-                await update.message.reply_text(
-                    "❌ Invalid command format\n"
-                    "──────────────────\n"
-                    "Use /admin for command list"
-                )
+                await update.message.reply_text("❌ Unknown command. Use /admin for help.")
+                
         except Exception as e:
             logger.error(f"Admin command error: {e}")
             await update.message.reply_text(
                 "❌ Error executing command\n"
-                "──────────────────\n"
-                "Please check logs for details"
+                "Check logs for details"
             )
 
     async def handle_admin_stats(self, update: Update):
@@ -885,7 +900,7 @@ async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Failed to send error message: {e}")
 
 def main():
-    """Start the bot with improved command handling"""
+    """Start the bot"""
     # Create application
     application = Application.builder().token(TOKEN).build()
     bot = SUIBot()
@@ -894,9 +909,9 @@ def main():
     # Initialize database
     asyncio.get_event_loop().run_until_complete(bot.init_db())
 
-    # Add handlers with proper command handling
+    # Add handlers - Asegurarse que el comando admin esté registrado primero
+    application.add_handler(CommandHandler("admin", bot.handle_admin_command))
     application.add_handler(CommandHandler("start", bot.start))
-    application.add_handler(CommandHandler("admin", bot.handle_admin_command))  # Admin commands
     application.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND, 
         bot.handle_message
@@ -905,7 +920,7 @@ def main():
     # Add error handler
     application.add_error_handler(error_handler)
 
-    logger.info("Bot started successfully!")
+    logger.info(f"Bot started. Admin ID: {bot.admin_id}")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == '__main__':

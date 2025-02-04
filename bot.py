@@ -66,11 +66,11 @@ if not all([TOKEN, ADMIN_ID, USDT_ADDRESS]):
 
 # Rewards system
 REWARDS = {
-    "claim": Decimal("1"),
-    "daily": Decimal("5"),
-    "referral": Decimal("3"),
-    "min_withdraw": Decimal("36"),
-    "network_fee": Decimal("2"),
+    "claim": Decimal("5"),
+    "daily": Decimal("25"),
+    "referral": Decimal("10"),
+    "min_withdraw": Decimal("100"),
+    "network_fee": Decimal("13"),
     "min_referrals": 10
 }
 
@@ -205,7 +205,7 @@ class DatabasePool:
                         cur.execute("""
                             SELECT user_id, username, balance, total_earned, 
                                    referrals, last_claim, last_daily, wallet, 
-                                   referred_by, join_date
+                                   referred_by, COALESCE(join_date, CURRENT_TIMESTAMP) as join_date
                             FROM users 
                             WHERE user_id = %s
                         """, (user_id,))
@@ -220,14 +220,11 @@ class DatabasePool:
                             return user_data
                         return None
                         
-            except psycopg2.OperationalError as e:
-                if attempt == max_retries - 1:
-                    logger.error(f"Final attempt failed for user {user_id}: {e}")
-                    raise
-                await asyncio.sleep(0.5 * (attempt + 1))
             except Exception as e:
                 logger.error(f"Error getting user {user_id}: {e}")
-                raise
+                if attempt == max_retries - 1:
+                    raise
+                await asyncio.sleep(0.5 * (attempt + 1))
 
     async def save_user(self, user_data: dict):
         """Save user with improved connection handling"""
@@ -878,7 +875,7 @@ class USDTBot:
                     cur.execute("""
                         SELECT user_id, username, balance, total_earned, 
                                referrals, last_claim, last_daily, wallet, 
-                               referred_by, join_date
+                               referred_by, COALESCE(join_date, CURRENT_TIMESTAMP) as join_date
                         FROM users 
                         WHERE user_id = %s
                     """, (user_id,))
